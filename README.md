@@ -50,7 +50,8 @@ Useful settings include:
 - bar mode: used (fills as quota is consumed) or remaining (fills with quota left, tooltips show "X% remaining")
 - label position and font size
 - account, label, bar, and tray spacing
-- compact percent text
+- compact percent text (each bar labelled with its own percentage)
+- percent text size (auto-fits the bar by default, or set an explicit size)
 - model weekly bar (third bar for a model-scoped weekly limit such as Fable)
 - click action: refresh account or open provider dashboard (Antigravity always refreshes)
 - cloud poll interval (Antigravity polls its local server every minute)

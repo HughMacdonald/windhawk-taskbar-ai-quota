@@ -139,7 +139,10 @@ Have a suggestion or found a bug?
   $description: 'Default: 4. Gap between quota bars and the system tray side.'
 - showPercentText: false
   $name: Show percent text
-  $description: 'Default: false. Shows compact 5h/week percentages over the bars.'
+  $description: 'Default: false. Shows each window''s percentage over its own bar.'
+- percentFontSize: 0
+  $name: Percent text size (px)
+  $description: 'Default: 0 (auto). Auto follows the label font size and shrinks to fit the bar. Set 6-24 to force a size; text bigger than the bar renders outside it and may overlap neighbouring bars, which keep their spacing.'
 - showCodexSparkInTooltip: false
   $name: Show Codex Spark in tooltip
   $description: 'Default: false. Shows OpenAI/Codex Spark plan and rate-limit lines in tooltips.'
@@ -267,6 +270,7 @@ struct Settings {
     int barLength = 100;
     int barThickness = 8;
     int labelFontSize = 11;
+    int percentFontSize = 0;  // 0 = auto (derived from labelFontSize, capped to the bar).
     int accountMargin = 3;
     int labelGap = 3;
     int barGap = 2;
@@ -316,7 +320,7 @@ struct AppliedState {
     uint32_t fillColor[kWindowCount] = {0, 0, 0};
     int barVisible[kWindowCount] = {-1, -1, -1};  // -1 unset, 0 collapsed, 1 visible.
     std::wstring tip;
-    std::wstring percentText;
+    std::wstring percentText[kWindowCount];
     std::wstring labelText;
     double labelOpacity = -1;
     double columnOpacity = -1;
@@ -343,9 +347,14 @@ struct AccountUiRefs {
     winrt::event_token toolTipOpenedToken{};
     DispatcherTimer manualToolTipTimer{nullptr};
     winrt::event_token manualToolTipTimerToken{};
-    std::array<Border, kWindowCount> tracks{Border{nullptr}, Border{nullptr}, Border{nullptr}};
+    // Outermost per-bar element (the percent-text cell when enabled, else the track);
+    // visibility is toggled here so a hidden bar takes no layout space.
+    std::array<FrameworkElement, kWindowCount> barSlots{FrameworkElement{nullptr},
+                                                        FrameworkElement{nullptr},
+                                                        FrameworkElement{nullptr}};
     std::array<Border, kWindowCount> fills{Border{nullptr}, Border{nullptr}, Border{nullptr}};
-    TextBlock percent{nullptr};
+    std::array<TextBlock, kWindowCount> percents{TextBlock{nullptr}, TextBlock{nullptr},
+                                                 TextBlock{nullptr}};
     TextBlock label{nullptr};
     POINT toolTipOpenCursor{};
     bool hasToolTipOpenCursor = false;
@@ -3297,7 +3306,8 @@ static void ClearQuotaEventState(QuotaUiInstance& state) {
 static Grid BuildQuotaGrid(QuotaUiInstance& state) {
     try {
         std::vector<AccountConfig> accounts;
-        int barLength, barThickness, labelFontSize, accountMargin, labelGap, barGap, rightMargin;
+        int barLength, barThickness, labelFontSize, percentFontSetting, accountMargin, labelGap,
+            barGap, rightMargin;
         bool showLabels, labelOnLeft, showPercentText;
         BarLayout barLayout;
         ClickAction clickAction;
@@ -3309,6 +3319,7 @@ static Grid BuildQuotaGrid(QuotaUiInstance& state) {
             barLength = g_settings.barLength;
             barThickness = g_settings.barThickness;
             labelFontSize = g_settings.labelFontSize;
+            percentFontSetting = g_settings.percentFontSize;
             accountMargin = g_settings.accountMargin;
             labelGap = g_settings.labelGap;
             barGap = g_settings.barGap;
@@ -3382,21 +3393,32 @@ static Grid BuildQuotaGrid(QuotaUiInstance& state) {
 
             double radius = std::max(1.0, barThickness / 2.0);
             double halfBarGap = barGap / 2.0;
+            // Per-bar percent labels sit on their own bar. Auto (0) follows the label font
+            // size and, in stacked layout, keeps the glyphs near the bar pitch so the column
+            // stays compact. An explicit size is honoured as given and simply overflows.
+            int percentFontSize = percentFontSetting;
+            if (percentFontSize <= 0) {
+                percentFontSize = std::max(6, labelFontSize - 2);
+                if (!verticalBars) {
+                    percentFontSize =
+                        std::min(percentFontSize, std::max(6, barThickness + barGap - 2));
+                }
+            }
             for (int w = 0; w < kWindowCount; w++) {
                 bool first = w == 0;
                 bool last = w == kWindowCount - 1;
+                Thickness barMargin =
+                    verticalBars
+                        ? Thickness{first ? 0 : halfBarGap, 0, last ? 0 : halfBarGap, 0}
+                        : Thickness{0, first ? 1 : halfBarGap, 0, last ? 1 : halfBarGap};
+
                 Border track;
                 track.Width(verticalBars ? barThickness : barLength);
                 track.Height(verticalBars ? barLength : barThickness);
                 track.CornerRadius({radius, radius, radius, radius});
-                track.Margin(verticalBars
-                                 ? Thickness{first ? 0 : halfBarGap, 0, last ? 0 : halfBarGap, 0}
-                                 : Thickness{0, first ? 1 : halfBarGap, 0, last ? 1 : halfBarGap});
                 track.HorizontalAlignment(HorizontalAlignment::Center);
+                track.VerticalAlignment(VerticalAlignment::Center);
                 track.Background(SolidColorBrush(winrt::Windows::UI::Color{0x46, 0x80, 0x80, 0x80}));
-                // The scoped bar only shows once a fetch reports data for it (UpdateQuotaUi).
-                if (w == kWinScoped) track.Visibility(Visibility::Collapsed);
-                refs.tracks[w] = track;
 
                 Border fill;
                 fill.Height(verticalBars ? 0 : barThickness);
@@ -3410,34 +3432,52 @@ static Grid BuildQuotaGrid(QuotaUiInstance& state) {
                 refs.fills[w] = fill;
 
                 track.Child(fill);
-                bars.Children().Append(track);
+
+                FrameworkElement slot{nullptr};
+                if (showPercentText) {
+                    // One percent label per bar, centered on it. The cell is pinned to the
+                    // bar's size so bar spacing never depends on the font.
+                    Grid cell;
+                    cell.Width(verticalBars ? barThickness : barLength);
+                    cell.Height(verticalBars ? barLength : barThickness);
+                    cell.HorizontalAlignment(HorizontalAlignment::Center);
+                    cell.VerticalAlignment(VerticalAlignment::Center);
+                    cell.Children().Append(track);
+
+                    TextBlock percent;
+                    percent.FontSize(percentFontSize);
+                    percent.HorizontalAlignment(HorizontalAlignment::Center);
+                    percent.VerticalAlignment(VerticalAlignment::Center);
+                    percent.TextAlignment(TextAlignment::Center);
+                    // XAML layout-clips a child arranged smaller than it wants, which crops
+                    // text bigger than the bar. Symmetric negative margins widen the label's
+                    // arrange rect past the cell without resizing it, so oversized text spills
+                    // over its bar (and its neighbours) instead of being cropped or pushing
+                    // the bars apart. Overhang scales with the font so it always has room.
+                    double overhangX = percentFontSize * 2.0;
+                    double overhangY = percentFontSize;
+                    percent.Margin({-overhangX, -overhangY, -overhangX, -overhangY});
+                    percent.Foreground(SolidColorBrush(winrt::Windows::UI::Color{255, 255, 255, 255}));
+                    percent.Opacity(0.9);
+                    percent.IsHitTestVisible(false);
+                    swprintf(name, ARRAYSIZE(name), L"AiQuota_Percent_%d_%d", (int)i, w);
+                    percent.Name(name);
+                    refs.percents[w] = percent;
+                    cell.Children().Append(percent);
+
+                    slot = cell;
+                } else {
+                    slot = track;
+                }
+
+                slot.Margin(barMargin);
+                // The scoped bar only shows once a fetch reports data for it (UpdateQuotaUi).
+                if (w == kWinScoped) slot.Visibility(Visibility::Collapsed);
+                refs.barSlots[w] = slot;
+                bars.Children().Append(slot);
             }
 
-            if (showPercentText) {
-                Grid overlay;
-                // Vertical width stays auto so the overlay tracks the visible bar count.
-                if (!verticalBars) overlay.Width(barLength);
-                if (verticalBars) overlay.Height(barLength);
-                overlay.VerticalAlignment(VerticalAlignment::Center);
-                overlay.Children().Append(bars);
-
-                TextBlock percent;
-                percent.FontSize(std::max(8, labelFontSize - 2));
-                percent.HorizontalAlignment(HorizontalAlignment::Center);
-                percent.VerticalAlignment(VerticalAlignment::Center);
-                percent.TextAlignment(TextAlignment::Center);
-                percent.Foreground(SolidColorBrush(winrt::Windows::UI::Color{255, 255, 255, 255}));
-                percent.Opacity(0.9);
-                percent.IsHitTestVisible(false);
-                swprintf(name, ARRAYSIZE(name), L"AiQuota_Percent_%d", (int)i);
-                percent.Name(name);
-                refs.percent = percent;
-                overlay.Children().Append(percent);
-
-                col.Children().Append(overlay);
-            } else {
-                col.Children().Append(bars);
-            }
+            col.Children().Append(bars);
 
             ToolTip toolTip;
             toolTip.Placement(wuxcp::PlacementMode::Top);
@@ -3786,9 +3826,9 @@ static void UpdateQuotaUi(QuotaUiInstance& state) {
                                    : wu.pct >= 0 || d.lastSuccessMs == 0;
                 int barVisible = showBar ? 1 : 0;
                 if (barVisible != ap.barVisible[w]) {
-                    if (ui.tracks[w]) {
-                        ui.tracks[w].Visibility(showBar ? Visibility::Visible
-                                                        : Visibility::Collapsed);
+                    if (ui.barSlots[w]) {
+                        ui.barSlots[w].Visibility(showBar ? Visibility::Visible
+                                                          : Visibility::Collapsed);
                     }
                     ap.barVisible[w] = barVisible;
                 }
@@ -3882,21 +3922,18 @@ static void UpdateQuotaUi(QuotaUiInstance& state) {
                    L" - click to refresh";
 
             if (showPercentText) {
-                std::wstring percentText;
-                int shownCount = 0;
+                // One label per bar, blank for bars with no data (their slot is collapsed).
                 for (int w = 0; w < kWindowCount; w++) {
-                    if (d.windows[w].pct < 0) continue;
-                    if (w == kWinScoped && !showModelWeeklyBar) continue;
-                    wchar_t text[32];
-                    swprintf(text, ARRAYSIZE(text), L"%.0f", displayPct(d.windows[w].pct));
-                    if (!percentText.empty()) percentText += L"/";
-                    percentText += text;
-                    shownCount++;
-                }
-                if (shownCount == 1) percentText += L"%";
-                if (percentText != ap.percentText) {
-                    if (ui.percent) ui.percent.Text(percentText);
-                    ap.percentText = percentText;
+                    std::wstring percentText;
+                    if (ap.barVisible[w] == 1 && d.windows[w].pct >= 0) {
+                        wchar_t text[16];
+                        swprintf(text, ARRAYSIZE(text), L"%.0f%%", displayPct(d.windows[w].pct));
+                        percentText = text;
+                    }
+                    if (percentText != ap.percentText[w]) {
+                        if (ui.percents[w]) ui.percents[w].Text(percentText);
+                        ap.percentText[w] = std::move(percentText);
+                    }
                 }
             }
 
@@ -4301,6 +4338,7 @@ static void LoadSettings() {
     int barLength = getIntSetting(L"barLength", 100);
     int barThickness = getIntSetting(L"barThickness", 8);
     int labelFontSize = getIntSetting(L"labelFontSize", 11);
+    int percentFontSize = getIntSetting(L"percentFontSize", 0);
     int accountMargin = getIntSetting(L"accountMargin", 3);
     int labelGap = getIntSetting(L"labelGap", 3);
     int barGap = getIntSetting(L"barGap", 2);
@@ -4332,6 +4370,8 @@ static void LoadSettings() {
     s.barLength = std::max(barLength > 0 ? barLength : 100, 10);
     s.barThickness = std::clamp(barThickness > 0 ? barThickness : 8, 2, 20);
     s.labelFontSize = std::clamp(labelFontSize > 0 ? labelFontSize : 11, 6, 24);
+    // 0 keeps the auto size; anything else is an explicit override of it.
+    s.percentFontSize = percentFontSize > 0 ? std::clamp(percentFontSize, 6, 24) : 0;
     s.accountMargin = std::max(accountMargin, 0);
     s.labelGap = std::max(labelGap, 0);
     s.barGap = std::max(barGap, 0);
