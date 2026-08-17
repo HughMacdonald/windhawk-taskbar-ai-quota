@@ -2,7 +2,7 @@
 // @id              taskbar-ai-quota
 // @name            Taskbar AI Quota Bars
 // @description     Shows compact 5-hour and weekly AI agent/LLM subscription quota bars for Anthropic, OpenAI, and Google Antigravity on the Windows 11 taskbar
-// @version         0.11.0
+// @version         0.12.0
 // @author          Cleroth
 // @github          https://github.com/Cleroth
 // @include         explorer.exe
@@ -25,6 +25,10 @@ Can show on the primary taskbar only, all taskbars, or one specific monitor.
 Each account gets one compact column:
 - stacked layout: stacked horizontal bars, filling left-to-right
 - vertical layout: side-by-side bars, filling bottom-up
+
+Bars adapt to what the provider reports: windows with no data are hidden once a fetch
+succeeds, and Anthropic accounts gain a third bar for a model-scoped weekly limit
+(e.g. Fable) when the API reports one.
 
 Hover for exact percentages and reset times. Click a column to refresh that account
 or open its provider dashboard, depending on settings and provider support. Right-click
@@ -139,6 +143,9 @@ Have a suggestion or found a bug?
 - showCodexSparkInTooltip: false
   $name: Show Codex Spark in tooltip
   $description: 'Default: false. Shows OpenAI/Codex Spark plan and rate-limit lines in tooltips.'
+- showModelWeeklyBar: true
+  $name: Show model weekly bar
+  $description: 'Default: true. Shows a third bar for a model-scoped weekly limit (e.g. Fable) when Anthropic reports one.'
 - yellowThreshold: 50
   $name: Yellow threshold (%)
   $description: 'Default: 50. Usage below this stays green.'
@@ -271,6 +278,7 @@ struct Settings {
     bool labelOnLeft = true;
     bool showPercentText = false;
     bool showCodexSparkInTooltip = false;
+    bool showModelWeeklyBar = true;
     bool colorblindMode = false;
     bool showStaleWarning = true;
     bool enableNotifications = true;
@@ -281,9 +289,18 @@ struct WindowUsage {
     ULONGLONG resetUnixMs = 0;
 };
 
+// Bar slots per account column. kWinScoped is a model-scoped weekly limit (e.g. Fable)
+// that Anthropic reports in its "limits" array; its bar only shows when data is present.
+enum WindowSlot {
+    kWin5h = 0,
+    kWinWeek = 1,
+    kWinScoped = 2,
+    kWindowCount = 3,
+};
+
 struct AccountData {
-    WindowUsage win5h;
-    WindowUsage winWeek;
+    std::array<WindowUsage, kWindowCount> windows;
+    std::wstring scopedWindowLabel;  // Model display name for kWinScoped (e.g. "Fable").
     std::wstring plan;
     std::wstring codexSparkLines;
     std::wstring extraLines;
@@ -295,8 +312,9 @@ struct AccountData {
 };
 
 struct AppliedState {
-    int fillPx[2] = {-1, -1};
-    uint32_t fillColor[2] = {0, 0};
+    int fillPx[kWindowCount] = {-1, -1, -1};
+    uint32_t fillColor[kWindowCount] = {0, 0, 0};
+    int barVisible[kWindowCount] = {-1, -1, -1};  // -1 unset, 0 collapsed, 1 visible.
     std::wstring tip;
     std::wstring percentText;
     std::wstring labelText;
@@ -325,7 +343,8 @@ struct AccountUiRefs {
     winrt::event_token toolTipOpenedToken{};
     DispatcherTimer manualToolTipTimer{nullptr};
     winrt::event_token manualToolTipTimerToken{};
-    std::array<Border, 2> fills{Border{nullptr}, Border{nullptr}};
+    std::array<Border, kWindowCount> tracks{Border{nullptr}, Border{nullptr}, Border{nullptr}};
+    std::array<Border, kWindowCount> fills{Border{nullptr}, Border{nullptr}, Border{nullptr}};
     TextBlock percent{nullptr};
     TextBlock label{nullptr};
     POINT toolTipOpenCursor{};
@@ -1883,12 +1902,34 @@ static bool ParseAnthropicUsage(const std::string& body, AccountData* d, std::ws
         }
 
         if (auto fh = GetObj(usage, L"five_hour")) {
-            d->win5h.pct = GetNum(fh, L"utilization");
-            d->win5h.resetUnixMs = ParseIso8601Ms(GetStr(fh, L"resets_at"));
+            d->windows[kWin5h].pct = GetNum(fh, L"utilization");
+            d->windows[kWin5h].resetUnixMs = ParseIso8601Ms(GetStr(fh, L"resets_at"));
         }
         if (auto sd = GetObj(usage, L"seven_day")) {
-            d->winWeek.pct = GetNum(sd, L"utilization");
-            d->winWeek.resetUnixMs = ParseIso8601Ms(GetStr(sd, L"resets_at"));
+            d->windows[kWinWeek].pct = GetNum(sd, L"utilization");
+            d->windows[kWinWeek].resetUnixMs = ParseIso8601Ms(GetStr(sd, L"resets_at"));
+        }
+
+        // Model-scoped weekly limit (e.g. Fable) only appears in the newer "limits" array:
+        // kind == "weekly_scoped" with scope.model.display_name. "percent" is an integer.
+        if (usage.HasKey(L"limits")) {
+            auto limitsVal = usage.GetNamedValue(L"limits");
+            if (limitsVal.ValueType() == JsonValueType::Array) {
+                auto limits = limitsVal.GetArray();
+                for (uint32_t i = 0; i < limits.Size(); i++) {
+                    if (limits.GetAt(i).ValueType() != JsonValueType::Object) continue;
+                    auto lim = limits.GetAt(i).GetObject();
+                    if (GetStr(lim, L"kind") != L"weekly_scoped") continue;
+                    std::wstring name = GetStr(GetObj(GetObj(lim, L"scope"), L"model"),
+                                               L"display_name");
+                    double pct = GetNum(lim, L"percent");
+                    if (name.empty() || pct < 0) continue;
+                    d->windows[kWinScoped].pct = pct;
+                    d->windows[kWinScoped].resetUnixMs = ParseIso8601Ms(GetStr(lim, L"resets_at"));
+                    d->scopedWindowLabel = std::move(name);
+                    break;
+                }
+            }
         }
 
         d->plan.clear();
@@ -1905,7 +1946,7 @@ static bool ParseAnthropicUsage(const std::string& body, AccountData* d, std::ws
             if (!d->extraLines.empty()) d->extraLines += L"\n";
             d->extraLines += line;
         }
-        bool parsed = d->win5h.pct >= 0 || d->winWeek.pct >= 0;
+        bool parsed = d->windows[kWin5h].pct >= 0 || d->windows[kWinWeek].pct >= 0;
         if (!parsed && error) *error = L"unexpected response format (" + DescribeJsonBody(body) + L")";
         return parsed;
     } catch (...) {
@@ -1954,8 +1995,8 @@ static bool ParseOpenAiUsage(const std::string& body, AccountData* d, std::wstri
             if (!window) return;
             WindowUsage* target = fallback;
             double windowSeconds = GetNum(window, L"limit_window_seconds", 0);
-            if (windowSeconds == 5 * 60 * 60) target = &d->win5h;
-            else if (windowSeconds == 7 * 24 * 60 * 60) target = &d->winWeek;
+            if (windowSeconds == 5 * 60 * 60) target = &d->windows[kWin5h];
+            else if (windowSeconds == 7 * 24 * 60 * 60) target = &d->windows[kWinWeek];
 
             double pct = GetNum(window, L"used_percent");
             if (pct < 0) {
@@ -1971,14 +2012,14 @@ static bool ParseOpenAiUsage(const std::string& body, AccountData* d, std::wstri
             target->resetUnixMs = resetUnixMs(window);
         };
 
-        applyWindow(GetObj(rl, L"primary_window"), &d->win5h);
-        applyWindow(GetObj(rl, L"secondary_window"), &d->winWeek);
-        applyWindow(GetObj(rl, L"primary"), &d->win5h);
-        applyWindow(GetObj(rl, L"secondary"), &d->winWeek);
-        applyWindow(GetObj(rl, L"five_hour"), &d->win5h);
-        applyWindow(GetObj(rl, L"weekly"), &d->winWeek);
-        applyWindow(GetObj(rl, L"five_hour_limit"), &d->win5h);
-        applyWindow(GetObj(rl, L"weekly_limit"), &d->winWeek);
+        applyWindow(GetObj(rl, L"primary_window"), &d->windows[kWin5h]);
+        applyWindow(GetObj(rl, L"secondary_window"), &d->windows[kWinWeek]);
+        applyWindow(GetObj(rl, L"primary"), &d->windows[kWin5h]);
+        applyWindow(GetObj(rl, L"secondary"), &d->windows[kWinWeek]);
+        applyWindow(GetObj(rl, L"five_hour"), &d->windows[kWin5h]);
+        applyWindow(GetObj(rl, L"weekly"), &d->windows[kWinWeek]);
+        applyWindow(GetObj(rl, L"five_hour_limit"), &d->windows[kWin5h]);
+        applyWindow(GetObj(rl, L"weekly_limit"), &d->windows[kWinWeek]);
 
         d->plan = GetStr(usage, L"plan_type");
         d->codexSparkLines.clear();
@@ -2030,7 +2071,7 @@ static bool ParseOpenAiUsage(const std::string& body, AccountData* d, std::wstri
                 d->extraLines += line;
             }
         }
-        bool parsed = d->win5h.pct >= 0 || d->winWeek.pct >= 0;
+        bool parsed = d->windows[kWin5h].pct >= 0 || d->windows[kWinWeek].pct >= 0;
         if (!parsed && error) *error = L"unexpected response format (" + DescribeJsonBody(body) + L")";
         return parsed;
     } catch (...) {
@@ -2386,11 +2427,11 @@ static bool ParseAntigravityQuotaSummary(const std::string& body, AccountData* d
                 ULONGLONG resetMs = ParseIso8601Ms(resetTimeStr);
                 double usedPct = std::clamp((1.0 - remaining) * 100.0, 0.0, 100.0);
                 if (is5h) {
-                    d->win5h.pct = usedPct;
-                    d->win5h.resetUnixMs = resetMs;
+                    d->windows[kWin5h].pct = usedPct;
+                    d->windows[kWin5h].resetUnixMs = resetMs;
                 } else {
-                    d->winWeek.pct = usedPct;
-                    d->winWeek.resetUnixMs = resetMs;
+                    d->windows[kWinWeek].pct = usedPct;
+                    d->windows[kWinWeek].resetUnixMs = resetMs;
                 }
                 parsed = true;
             }
@@ -2725,16 +2766,16 @@ static DWORD WINAPI FetchThreadProc(LPVOID) {
     std::vector<std::wstring> lastLoggedErrorStates;
     std::vector<ULONGLONG> retryDeadlineMs;
     std::vector<ULONGLONG> nextPollDeadlineMs;
-    // Per-account red-crossing arm state, indexed [account][0=5h,1=weekly]:
+    // Per-account red-crossing arm state, indexed [account][WindowSlot]:
     // -1 unknown (primes without firing), 0 below/armed, 1 above/already notified.
-    std::vector<std::array<int, 2>> redState;
+    std::vector<std::array<int, kWindowCount>> redState;
     ULONGLONG lastLoggedSettingsGeneration = 0;
     while (!g_unloading) {
         ULONGLONG refreshGeneration = g_refreshGeneration.load();
         int refreshAccountIndex = g_refreshAccountIndex.load();
         std::vector<AccountConfig> accounts;
         int intervalMin, redThreshold;
-        bool enableNotifications;
+        bool enableNotifications, showModelWeeklyBar;
         ULONGLONG settingsGeneration;
         {
             std::lock_guard<std::mutex> lk(g_settingsMutex);
@@ -2742,6 +2783,7 @@ static DWORD WINAPI FetchThreadProc(LPVOID) {
             intervalMin = g_settings.pollMinutes;
             redThreshold = g_settings.redThreshold;
             enableNotifications = g_settings.enableNotifications;
+            showModelWeeklyBar = g_settings.showModelWeeklyBar;
             settingsGeneration = g_settingsGeneration;
         }
         bool settingsChanged = lastLoggedSettingsGeneration != settingsGeneration ||
@@ -2759,10 +2801,10 @@ static DWORD WINAPI FetchThreadProc(LPVOID) {
             if (g_data.size() == results.size()) results = g_data;
         }
         if (settingsChanged || redState.size() != accounts.size()) {
-            redState.assign(accounts.size(), std::array<int, 2>{-1, -1});
+            redState.assign(accounts.size(), std::array<int, kWindowCount>{-1, -1, -1});
             for (size_t i = 0; i < accounts.size(); i++) {
-                for (int w = 0; w < 2; w++) {
-                    const WindowUsage& wu = w == 0 ? results[i].win5h : results[i].winWeek;
+                for (int w = 0; w < kWindowCount; w++) {
+                    const WindowUsage& wu = results[i].windows[w];
                     if (wu.pct >= 0) redState[i][w] = wu.pct >= redThreshold ? 1 : 0;
                 }
             }
@@ -2871,16 +2913,23 @@ static DWORD WINAPI FetchThreadProc(LPVOID) {
             // matching settings generation publishes, avoiding stale in-flight toasts.
             for (size_t i = 0; i < accounts.size(); i++) {
                 if (!fetchedOk[i]) continue;
-                for (int w = 0; w < 2; w++) {
-                    const WindowUsage& wu = w == 0 ? results[i].win5h : results[i].winWeek;
+                for (int w = 0; w < kWindowCount; w++) {
+                    const WindowUsage& wu = results[i].windows[w];
                     int& st = redState[i][w];
                     if (wu.pct < 0) continue;
+                    if (w == kWinScoped && !showModelWeeklyBar) continue;
                     if (wu.pct >= redThreshold) {
                         if (st == 0 && enableNotifications) {
                             std::wstring providerName = ProviderDisplayName(accounts[i].provider);
+                            std::wstring windowName =
+                                w == kWin5h ? L"5h" :
+                                w == kWinWeek ? L"weekly" :
+                                (results[i].scopedWindowLabel.empty()
+                                     ? std::wstring(L"model")
+                                     : results[i].scopedWindowLabel) + L" weekly";
                             wchar_t title[96];
                             swprintf(title, ARRAYSIZE(title), L"%s usage at %.0f%%",
-                                     w == 0 ? L"5h" : L"weekly", wu.pct);
+                                     windowName.c_str(), wu.pct);
                             std::wstring body = providerName + L" - resets " + FormatReset(wu.resetUnixMs);
                             FireThresholdNotification(title, body);
                         }
@@ -3333,16 +3382,21 @@ static Grid BuildQuotaGrid(QuotaUiInstance& state) {
 
             double radius = std::max(1.0, barThickness / 2.0);
             double halfBarGap = barGap / 2.0;
-            for (int w = 0; w < 2; w++) {
+            for (int w = 0; w < kWindowCount; w++) {
+                bool first = w == 0;
+                bool last = w == kWindowCount - 1;
                 Border track;
                 track.Width(verticalBars ? barThickness : barLength);
                 track.Height(verticalBars ? barLength : barThickness);
                 track.CornerRadius({radius, radius, radius, radius});
-                track.Margin(verticalBars ?
-                                 (w == 0 ? Thickness{0, 0, halfBarGap, 0} : Thickness{halfBarGap, 0, 0, 0}) :
-                                 (w == 0 ? Thickness{0, 1, 0, halfBarGap} : Thickness{0, halfBarGap, 0, 1}));
+                track.Margin(verticalBars
+                                 ? Thickness{first ? 0 : halfBarGap, 0, last ? 0 : halfBarGap, 0}
+                                 : Thickness{0, first ? 1 : halfBarGap, 0, last ? 1 : halfBarGap});
                 track.HorizontalAlignment(HorizontalAlignment::Center);
                 track.Background(SolidColorBrush(winrt::Windows::UI::Color{0x46, 0x80, 0x80, 0x80}));
+                // The scoped bar only shows once a fetch reports data for it (UpdateQuotaUi).
+                if (w == kWinScoped) track.Visibility(Visibility::Collapsed);
+                refs.tracks[w] = track;
 
                 Border fill;
                 fill.Height(verticalBars ? 0 : barThickness);
@@ -3361,7 +3415,8 @@ static Grid BuildQuotaGrid(QuotaUiInstance& state) {
 
             if (showPercentText) {
                 Grid overlay;
-                overlay.Width(verticalBars ? barThickness * 2.0 + barGap : barLength);
+                // Vertical width stays auto so the overlay tracks the visible bar count.
+                if (!verticalBars) overlay.Width(barLength);
                 if (verticalBars) overlay.Height(barLength);
                 overlay.VerticalAlignment(VerticalAlignment::Center);
                 overlay.Children().Append(bars);
@@ -3658,7 +3713,8 @@ static void UpdateQuotaUi(QuotaUiInstance& state) {
 
     std::vector<AccountConfig> accounts;
     int intervalMin, barLength, yellowThreshold, orangeThreshold, redThreshold;
-    bool showPercentText, showCodexSparkInTooltip, colorblindMode, showStaleWarning;
+    bool showPercentText, showCodexSparkInTooltip, showModelWeeklyBar, colorblindMode,
+        showStaleWarning;
     BarLayout barLayout;
     BarMode barMode;
     ClickAction clickAction;
@@ -3675,6 +3731,7 @@ static void UpdateQuotaUi(QuotaUiInstance& state) {
         redThreshold = g_settings.redThreshold;
         showPercentText = g_settings.showPercentText;
         showCodexSparkInTooltip = g_settings.showCodexSparkInTooltip;
+        showModelWeeklyBar = g_settings.showModelWeeklyBar;
         colorblindMode = g_settings.colorblindMode;
         showStaleWarning = g_settings.showStaleWarning;
     }
@@ -3720,8 +3777,23 @@ static void UpdateQuotaUi(QuotaUiInstance& state) {
             bool warn = showStaleWarning && stale && !d.error.empty();
             bool accountRefreshing = refreshing && (refreshAccountIndex < 0 || refreshAccountIndex == (int)i);
 
-            for (int w = 0; w < 2; w++) {
-                const WindowUsage& wu = w == 0 ? d.win5h : d.winWeek;
+            for (int w = 0; w < kWindowCount; w++) {
+                const WindowUsage& wu = d.windows[w];
+                // Bars adapt to reported data: before the first successful fetch the classic
+                // 5h/week pair shows (loading/error look), afterwards only windows with data.
+                bool showBar = w == kWinScoped
+                                   ? showModelWeeklyBar && wu.pct >= 0
+                                   : wu.pct >= 0 || d.lastSuccessMs == 0;
+                int barVisible = showBar ? 1 : 0;
+                if (barVisible != ap.barVisible[w]) {
+                    if (ui.tracks[w]) {
+                        ui.tracks[w].Visibility(showBar ? Visibility::Visible
+                                                        : Visibility::Collapsed);
+                    }
+                    ap.barVisible[w] = barVisible;
+                }
+                if (!showBar) continue;
+
                 double dispPct = displayPct(wu.pct);
                 int px = dispPct > 0 ? std::clamp((int)std::lround(barLength * dispPct / 100.0), 2, barLength) : 0;
                 // Color stays keyed to actual usage so depleting quota still reds out.
@@ -3750,19 +3822,28 @@ static void UpdateQuotaUi(QuotaUiInstance& state) {
                 tip += L" (" + d.plan + L")";
             }
             wchar_t line[160];
-            if (d.win5h.pct >= 0) {
-                swprintf(line, ARRAYSIZE(line), L"\n5h: %.0f%%%s | resets %s", displayPct(d.win5h.pct),
-                         remainingSuffix, FormatReset(d.win5h.resetUnixMs).c_str());
+            if (d.windows[kWin5h].pct >= 0) {
+                swprintf(line, ARRAYSIZE(line), L"\n5h: %.0f%%%s | resets %s",
+                         displayPct(d.windows[kWin5h].pct), remainingSuffix,
+                         FormatReset(d.windows[kWin5h].resetUnixMs).c_str());
                 tip += line;
             } else {
                 tip += L"\n5h: n/a";
             }
-            if (d.winWeek.pct >= 0) {
-                swprintf(line, ARRAYSIZE(line), L"\nweek: %.0f%%%s | resets %s", displayPct(d.winWeek.pct),
-                         remainingSuffix, FormatReset(d.winWeek.resetUnixMs).c_str());
+            if (d.windows[kWinWeek].pct >= 0) {
+                swprintf(line, ARRAYSIZE(line), L"\nweek: %.0f%%%s | resets %s",
+                         displayPct(d.windows[kWinWeek].pct), remainingSuffix,
+                         FormatReset(d.windows[kWinWeek].resetUnixMs).c_str());
                 tip += line;
             } else {
                 tip += L"\nweek: n/a";
+            }
+            if (showModelWeeklyBar && d.windows[kWinScoped].pct >= 0 &&
+                !d.scopedWindowLabel.empty()) {
+                swprintf(line, ARRAYSIZE(line), L"\n%s wk: %.0f%%%s | resets %s",
+                         d.scopedWindowLabel.c_str(), displayPct(d.windows[kWinScoped].pct),
+                         remainingSuffix, FormatReset(d.windows[kWinScoped].resetUnixMs).c_str());
+                tip += line;
             }
             if (showCodexSparkInTooltip && accounts[i].provider == L"openai" && !d.codexSparkLines.empty()) {
                 tip += L"\n" + d.codexSparkLines;
@@ -3802,15 +3883,17 @@ static void UpdateQuotaUi(QuotaUiInstance& state) {
 
             if (showPercentText) {
                 std::wstring percentText;
-                if (d.win5h.pct >= 0 && d.winWeek.pct >= 0) {
+                int shownCount = 0;
+                for (int w = 0; w < kWindowCount; w++) {
+                    if (d.windows[w].pct < 0) continue;
+                    if (w == kWinScoped && !showModelWeeklyBar) continue;
                     wchar_t text[32];
-                    swprintf(text, ARRAYSIZE(text), L"%.0f/%.0f", displayPct(d.win5h.pct), displayPct(d.winWeek.pct));
-                    percentText = text;
-                } else if (d.win5h.pct >= 0 || d.winWeek.pct >= 0) {
-                    wchar_t text[32];
-                    swprintf(text, ARRAYSIZE(text), L"%.0f%%", displayPct(d.win5h.pct >= 0 ? d.win5h.pct : d.winWeek.pct));
-                    percentText = text;
+                    swprintf(text, ARRAYSIZE(text), L"%.0f", displayPct(d.windows[w].pct));
+                    if (!percentText.empty()) percentText += L"/";
+                    percentText += text;
+                    shownCount++;
                 }
+                if (shownCount == 1) percentText += L"%";
                 if (percentText != ap.percentText) {
                     if (ui.percent) ui.percent.Text(percentText);
                     ap.percentText = percentText;
@@ -4260,6 +4343,7 @@ static void LoadSettings() {
     s.labelOnLeft = getBoolSetting(L"labelOnLeft", true);
     s.showPercentText = getBoolSetting(L"showPercentText", false);
     s.showCodexSparkInTooltip = getBoolSetting(L"showCodexSparkInTooltip", false);
+    s.showModelWeeklyBar = getBoolSetting(L"showModelWeeklyBar", true);
     s.colorblindMode = getBoolSetting(L"colorblindMode", false);
     s.showStaleWarning = getBoolSetting(L"showStaleWarning", true);
     s.enableNotifications = getBoolSetting(L"enableNotifications", true);

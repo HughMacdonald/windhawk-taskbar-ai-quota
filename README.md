@@ -13,6 +13,11 @@ Each configured account gets one compact taskbar column:
 - stacked layout: top bar = 5-hour usage, bottom bar = weekly usage
 - vertical layout: side-by-side 5h | weekly bars, both filling bottom-up
 
+Bars adapt to what the provider reports: once a fetch succeeds, windows with no data are
+hidden (e.g. an OpenAI account with no 5-hour window shows a single weekly bar), and
+Anthropic accounts gain a third bar for a model-scoped weekly limit (e.g. Fable) when
+the API reports one.
+
 Hover for exact percentages and reset times. Click a column to refresh that account or open its provider dashboard, depending on settings and provider support. Right-click a column for Refresh all, provider actions, and show/hide toggles.
 
 Bars use configurable green/yellow/orange/red thresholds, with an optional colorblind palette. Stale errors can mark labels and tooltips with `!`.
@@ -46,6 +51,7 @@ Useful settings include:
 - label position and font size
 - account, label, bar, and tray spacing
 - compact percent text
+- model weekly bar (third bar for a model-scoped weekly limit such as Fable)
 - click action: refresh account or open provider dashboard (Antigravity always refreshes)
 - cloud poll interval (Antigravity polls its local server every minute)
 - taskbar monitor mode: primary, all, or specific monitor number (`1` = primary, `2+` = secondary taskbars)
