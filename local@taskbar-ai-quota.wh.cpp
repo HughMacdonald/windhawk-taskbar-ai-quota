@@ -38,6 +38,9 @@ one account always stays visible).
 Bars use configurable green/yellow/orange/red thresholds, with a colorblind palette option.
 Stale errors can mark labels/tooltips with `!`.
 
+An optional status dot beside each Anthropic/OpenAI account shows the current Claude Code
+component status from status.claude.com or rolled-up Codex status from status.openai.com.
+
 Optionally fires a Windows notification when an account first crosses the red threshold
 (5-hour or weekly), so you don't have to keep glancing at the bars.
 
@@ -149,6 +152,9 @@ Have a suggestion or found a bug?
 - showModelWeeklyBar: true
   $name: Show model weekly bar
   $description: 'Default: true. Shows a third bar for a model-scoped weekly limit (e.g. Fable) when Anthropic reports one.'
+- showServiceStatus: false
+  $name: Show service status
+  $description: 'Default: false. Shows a coloured status dot beside each account: Claude Code status for Anthropic and rolled-up Codex status for OpenAI.'
 - yellowThreshold: 50
   $name: Yellow threshold (%)
   $description: 'Default: 50. Usage below this stays green.'
@@ -283,6 +289,7 @@ struct Settings {
     bool showPercentText = false;
     bool showCodexSparkInTooltip = false;
     bool showModelWeeklyBar = true;
+    bool showServiceStatus = false;
     bool colorblindMode = false;
     bool showStaleWarning = true;
     bool enableNotifications = true;
@@ -315,6 +322,24 @@ struct AccountData {
     bool needsLogin = false;  // Sign-in required; left-click signs in instead of refreshing.
 };
 
+enum class ServiceStatusLevel {
+    Unknown,
+    Operational,
+    Maintenance,
+    Degraded,
+    PartialOutage,
+    MajorOutage,
+};
+
+struct ServiceStatusData {
+    ServiceStatusLevel level = ServiceStatusLevel::Unknown;
+    std::wstring description;
+    std::wstring error;
+    ULONGLONG lastSuccessMs = 0;
+};
+
+static constexpr int kServiceStatusCount = 2;  // Anthropic, OpenAI.
+
 struct AppliedState {
     int fillPx[kWindowCount] = {-1, -1, -1};
     uint32_t fillColor[kWindowCount] = {0, 0, 0};
@@ -322,6 +347,7 @@ struct AppliedState {
     std::wstring tip;
     std::wstring percentText[kWindowCount];
     std::wstring labelText;
+    uint32_t serviceStatusColor = 0;
     double labelOpacity = -1;
     double columnOpacity = -1;
     int visible = -1;  // -1 unset, 0 collapsed, 1 visible.
@@ -355,6 +381,7 @@ struct AccountUiRefs {
     std::array<Border, kWindowCount> fills{Border{nullptr}, Border{nullptr}, Border{nullptr}};
     std::array<TextBlock, kWindowCount> percents{TextBlock{nullptr}, TextBlock{nullptr},
                                                  TextBlock{nullptr}};
+    Border serviceStatusDot{nullptr};
     TextBlock label{nullptr};
     POINT toolTipOpenCursor{};
     bool hasToolTipOpenCursor = false;
@@ -381,6 +408,7 @@ static Settings g_settings;
 static std::mutex g_settingsMutex;
 static ULONGLONG g_settingsGeneration = 0;
 static std::vector<AccountData> g_data;
+static std::array<ServiceStatusData, kServiceStatusCount> g_serviceStatuses;
 static std::mutex g_dataMutex;
 
 static std::atomic<bool> g_unloading{false};
@@ -587,6 +615,29 @@ static winrt::Windows::UI::Color UsageColor(double pct, bool stale, int yellowTh
     return {255, 0x43, 0xA0, 0x47};
 }
 
+static winrt::Windows::UI::Color ServiceStatusColor(ServiceStatusLevel level,
+                                                     bool colorblindMode) {
+    if (colorblindMode) {
+        switch (level) {
+            case ServiceStatusLevel::Operational: return {255, 0x00, 0x72, 0xB2};
+            case ServiceStatusLevel::Maintenance: return {255, 0xCC, 0x79, 0xA7};
+            case ServiceStatusLevel::Degraded: return {255, 0xF0, 0xE4, 0x42};
+            case ServiceStatusLevel::PartialOutage: return {255, 0xE6, 0x9F, 0x00};
+            case ServiceStatusLevel::MajorOutage: return {255, 0xD5, 0x5E, 0x00};
+            default: return {255, 0x9E, 0x9E, 0x9E};
+        }
+    }
+
+    switch (level) {
+        case ServiceStatusLevel::Operational: return {255, 0x43, 0xA0, 0x47};
+        case ServiceStatusLevel::Maintenance: return {255, 0x1E, 0x88, 0xE5};
+        case ServiceStatusLevel::Degraded: return {255, 0xFD, 0xD8, 0x35};
+        case ServiceStatusLevel::PartialOutage: return {255, 0xFB, 0x8C, 0x00};
+        case ServiceStatusLevel::MajorOutage: return {255, 0xE5, 0x39, 0x35};
+        default: return {255, 0x9E, 0x9E, 0x9E};
+    }
+}
+
 static void UpdateQuotaToolTip(ToolTip const& toolTip, std::wstring const& tip, bool hasError) {
     constexpr double maxWidth = 460;
     auto muted = SolidColorBrush(winrt::Windows::UI::Color{255, 0xD6, 0xD6, 0xD6});
@@ -690,6 +741,10 @@ static void UpdateQuotaToolTip(ToolTip const& toolTip, std::wstring const& tip, 
                 highlightStart = line.find(L"no data yet", labelEnd);
                 if (highlightStart != std::wstring::npos) highlightEnd = highlightStart + 11;
                 labelBold = true;
+            } else if (line.rfind(L"status:", 0) == 0) {
+                labelBrush = infoLabel;
+                labelEnd = 7;
+                labelBold = true;
             }
 
             size_t textStart = 0;
@@ -764,6 +819,12 @@ static PCWSTR ProviderDisplayName(const std::wstring& provider) {
     if (provider == L"anthropic") return L"Anthropic";
     if (provider == L"openai") return L"OpenAI";
     return L"Google Antigravity";
+}
+
+static int ProviderServiceStatusIndex(const std::wstring& provider) {
+    if (provider == L"anthropic") return 0;
+    if (provider == L"openai") return 1;
+    return -1;
 }
 
 static void RefreshQuota(int accountIndex) {
@@ -1279,6 +1340,129 @@ static HttpResult HttpRequest(PCWSTR method, PCWSTR host, PCWSTR path, PCWSTR us
     if (con && UntrackHttpHandle(con)) WinHttpCloseHandle(con);
     if (ses && UntrackHttpHandle(ses)) WinHttpCloseHandle(ses);
     return res;
+}
+
+static ServiceStatusLevel ParseServiceStatusLevel(std::wstring indicator,
+                                                  std::wstring description) {
+    auto normalize = [](std::wstring value) {
+        std::transform(value.begin(), value.end(), value.begin(), [](wchar_t ch) {
+            if (ch == L'-' || ch == L' ') return L'_';
+            return (wchar_t)towlower(ch);
+        });
+        return value;
+    };
+    indicator = normalize(std::move(indicator));
+    description = normalize(std::move(description));
+
+    if (indicator == L"none" || indicator == L"operational") {
+        return ServiceStatusLevel::Operational;
+    }
+    if (indicator.find(L"critical") != std::wstring::npos ||
+        indicator.find(L"full_outage") != std::wstring::npos ||
+        indicator.find(L"major_outage") != std::wstring::npos) {
+        return ServiceStatusLevel::MajorOutage;
+    }
+    if (indicator.find(L"major") != std::wstring::npos ||
+        indicator.find(L"partial") != std::wstring::npos) {
+        return ServiceStatusLevel::PartialOutage;
+    }
+    if (indicator.find(L"minor") != std::wstring::npos ||
+        indicator.find(L"degraded") != std::wstring::npos) {
+        return ServiceStatusLevel::Degraded;
+    }
+    if (indicator.find(L"maintenance") != std::wstring::npos) {
+        return ServiceStatusLevel::Maintenance;
+    }
+
+    if (description.find(L"major_outage") != std::wstring::npos) {
+        return ServiceStatusLevel::MajorOutage;
+    }
+    if (description.find(L"partial_outage") != std::wstring::npos) {
+        return ServiceStatusLevel::PartialOutage;
+    }
+    if (description.find(L"degraded") != std::wstring::npos) {
+        return ServiceStatusLevel::Degraded;
+    }
+    if (description.find(L"maintenance") != std::wstring::npos) {
+        return ServiceStatusLevel::Maintenance;
+    }
+    if (description.find(L"operational") != std::wstring::npos) {
+        return ServiceStatusLevel::Operational;
+    }
+    return ServiceStatusLevel::Unknown;
+}
+
+static PCWSTR ServiceStatusLevelDescription(ServiceStatusLevel level) {
+    switch (level) {
+        case ServiceStatusLevel::Operational: return L"Operational";
+        case ServiceStatusLevel::Maintenance: return L"Maintenance";
+        case ServiceStatusLevel::Degraded: return L"Degraded Performance";
+        case ServiceStatusLevel::PartialOutage: return L"Partial Outage";
+        case ServiceStatusLevel::MajorOutage: return L"Major Outage";
+        default: return L"Unknown";
+    }
+}
+
+static ServiceStatusData FetchServiceStatus(int providerIndex) {
+    ServiceStatusData result;
+    PCWSTR host = providerIndex == 0 ? L"status.claude.com" : L"status.openai.com";
+    HttpResult response = HttpRequest(L"GET", host, L"/api/v2/components.json",
+                                      L"taskbar-ai-quota/0.13",
+                                      L"Accept: application/json\r\n");
+    if (!response.ok) {
+        result.error = L"network error";
+        return result;
+    }
+    if (response.status != 200) {
+        result.error = L"HTTP " + std::to_wstring(response.status);
+        return result;
+    }
+
+    try {
+        JsonObject root = JsonObject::Parse(Utf8ToWide(response.body));
+        if (!root.HasKey(L"components") ||
+            root.GetNamedValue(L"components").ValueType() != JsonValueType::Array) {
+            result.error = L"unexpected response";
+            return result;
+        }
+
+        static constexpr std::array<PCWSTR, 4> kOpenAiCodexComponents = {
+            L"Codex Web", L"Codex API", L"CLI", L"VS Code extension"};
+        JsonArray components = root.GetNamedArray(L"components");
+        int matchedComponents = 0;
+        for (uint32_t i = 0; i < components.Size(); i++) {
+            if (components.GetAt(i).ValueType() != JsonValueType::Object) continue;
+            JsonObject component = components.GetObjectAt(i);
+            std::wstring name = GetStr(component, L"name");
+            bool matches = providerIndex == 0 && _wcsicmp(name.c_str(), L"Claude Code") == 0;
+            if (providerIndex == 1) {
+                matches = std::any_of(kOpenAiCodexComponents.begin(),
+                                      kOpenAiCodexComponents.end(), [&](PCWSTR candidate) {
+                    return _wcsicmp(name.c_str(), candidate) == 0;
+                });
+            }
+            if (!matches) continue;
+
+            matchedComponents++;
+            ServiceStatusLevel level =
+                ParseServiceStatusLevel(GetStr(component, L"status"), L"");
+            if (level == ServiceStatusLevel::Unknown) {
+                result.error = L"unknown component status";
+                return result;
+            }
+            if ((int)level > (int)result.level) result.level = level;
+        }
+        if (matchedComponents == 0) {
+            result.error = L"component not found";
+            return result;
+        }
+        result.description = std::wstring(providerIndex == 0 ? L"Claude Code: " : L"Codex: ") +
+                             ServiceStatusLevelDescription(result.level);
+        result.lastSuccessMs = NowUnixMs();
+    } catch (...) {
+        result.error = L"unexpected response";
+    }
+    return result;
 }
 
 /**********************************************/
@@ -2775,6 +2959,8 @@ static DWORD WINAPI FetchThreadProc(LPVOID) {
     std::vector<std::wstring> lastLoggedErrorStates;
     std::vector<ULONGLONG> retryDeadlineMs;
     std::vector<ULONGLONG> nextPollDeadlineMs;
+    std::array<std::wstring, kServiceStatusCount> lastLoggedServiceStatusErrors;
+    ULONGLONG nextServiceStatusPollMs = 0;
     // Per-account red-crossing arm state, indexed [account][WindowSlot]:
     // -1 unknown (primes without firing), 0 below/armed, 1 above/already notified.
     std::vector<std::array<int, kWindowCount>> redState;
@@ -2784,7 +2970,7 @@ static DWORD WINAPI FetchThreadProc(LPVOID) {
         int refreshAccountIndex = g_refreshAccountIndex.load();
         std::vector<AccountConfig> accounts;
         int intervalMin, redThreshold;
-        bool enableNotifications, showModelWeeklyBar;
+        bool enableNotifications, showModelWeeklyBar, showServiceStatus;
         ULONGLONG settingsGeneration;
         {
             std::lock_guard<std::mutex> lk(g_settingsMutex);
@@ -2793,6 +2979,7 @@ static DWORD WINAPI FetchThreadProc(LPVOID) {
             redThreshold = g_settings.redThreshold;
             enableNotifications = g_settings.enableNotifications;
             showModelWeeklyBar = g_settings.showModelWeeklyBar;
+            showServiceStatus = g_settings.showServiceStatus;
             settingsGeneration = g_settingsGeneration;
         }
         bool settingsChanged = lastLoggedSettingsGeneration != settingsGeneration ||
@@ -2801,13 +2988,16 @@ static DWORD WINAPI FetchThreadProc(LPVOID) {
             lastLoggedErrorStates.assign(accounts.size(), {});
             retryDeadlineMs.assign(accounts.size(), 0);
             nextPollDeadlineMs.assign(accounts.size(), 0);
+            nextServiceStatusPollMs = 0;
             lastLoggedSettingsGeneration = settingsGeneration;
         }
 
         std::vector<AccountData> results(accounts.size());
+        std::array<ServiceStatusData, kServiceStatusCount> serviceStatuses;
         {
             std::lock_guard<std::mutex> lk(g_dataMutex);
             if (g_data.size() == results.size()) results = g_data;
+            serviceStatuses = g_serviceStatuses;
         }
         if (settingsChanged || redState.size() != accounts.size()) {
             redState.assign(accounts.size(), std::array<int, kWindowCount>{-1, -1, -1});
@@ -2822,6 +3012,37 @@ static DWORD WINAPI FetchThreadProc(LPVOID) {
         bool manualRefresh = g_refreshing.load();
         bool refreshSingleAccount = manualRefresh && refreshAccountIndex >= 0 &&
                                     refreshAccountIndex < (int)accounts.size();
+
+        std::array<bool, kServiceStatusCount> serviceStatusNeeded{};
+        if (showServiceStatus) {
+            for (const auto& account : accounts) {
+                int index = ProviderServiceStatusIndex(account.provider);
+                if (!account.hidden && index >= 0) serviceStatusNeeded[index] = true;
+            }
+        }
+        bool hasNeededServiceStatus = serviceStatusNeeded[0] || serviceStatusNeeded[1];
+        ULONGLONG statusNowMs = NowUnixMs();
+        if (hasNeededServiceStatus &&
+            (manualRefresh || nextServiceStatusPollMs == 0 ||
+             nextServiceStatusPollMs <= statusNowMs)) {
+            static constexpr std::array<PCWSTR, kServiceStatusCount> kStatusNames = {
+                L"Claude Code", L"Codex"};
+            for (int i = 0; i < kServiceStatusCount && !g_unloading; i++) {
+                if (!serviceStatusNeeded[i]) continue;
+                serviceStatuses[i] = FetchServiceStatus(i);
+                if (serviceStatuses[i].error != lastLoggedServiceStatusErrors[i]) {
+                    if (!serviceStatuses[i].error.empty()) {
+                        Wh_Log(L"Status fetch (%s): %s", kStatusNames[i],
+                               serviceStatuses[i].error.c_str());
+                    }
+                    lastLoggedServiceStatusErrors[i] = serviceStatuses[i].error;
+                }
+            }
+            nextServiceStatusPollMs = NowUnixMs() + 5ULL * 60000;
+        } else if (!hasNeededServiceStatus) {
+            nextServiceStatusPollMs = 0;
+        }
+
         std::vector<bool> fetchedOk(accounts.size(), false);
         ULONGLONG nextRetryMs = 0;
         ULONGLONG nextPollMs = 0;
@@ -2908,6 +3129,7 @@ static DWORD WINAPI FetchThreadProc(LPVOID) {
                 std::lock_guard<std::mutex> lk2(g_dataMutex);
                 if (g_data.size() == results.size()) {
                     g_data = results;
+                    g_serviceStatuses = serviceStatuses;
                     published = true;
                 }
             }
@@ -2962,6 +3184,11 @@ static DWORD WINAPI FetchThreadProc(LPVOID) {
             waitMs = 0;
         } else if (nextPollMs > nowMs) {
             waitMs = (DWORD)std::min<ULONGLONG>(waitMs, nextPollMs - nowMs);
+        }
+        if (hasNeededServiceStatus && nextServiceStatusPollMs <= nowMs) {
+            waitMs = 0;
+        } else if (hasNeededServiceStatus && nextServiceStatusPollMs > nowMs) {
+            waitMs = (DWORD)std::min<ULONGLONG>(waitMs, nextServiceStatusPollMs - nowMs);
         }
 
         HANDLE handles[2] = {g_stopEvent, g_refreshEvent};
@@ -3308,7 +3535,7 @@ static Grid BuildQuotaGrid(QuotaUiInstance& state) {
         std::vector<AccountConfig> accounts;
         int barLength, barThickness, labelFontSize, percentFontSetting, accountMargin, labelGap,
             barGap, rightMargin;
-        bool showLabels, labelOnLeft, showPercentText;
+        bool showLabels, labelOnLeft, showPercentText, showServiceStatus;
         BarLayout barLayout;
         ClickAction clickAction;
         {
@@ -3327,6 +3554,7 @@ static Grid BuildQuotaGrid(QuotaUiInstance& state) {
             showLabels = g_settings.showLabels;
             labelOnLeft = g_settings.labelOnLeft;
             showPercentText = g_settings.showPercentText;
+            showServiceStatus = g_settings.showServiceStatus;
         }
         state.accountRefs.clear();
         if (accounts.empty()) return nullptr;
@@ -3362,7 +3590,7 @@ static Grid BuildQuotaGrid(QuotaUiInstance& state) {
         wchar_t name[64];
         for (size_t i = 0; i < accounts.size(); i++) {
             StackPanel col;
-            col.Orientation(labelOnLeft ? Orientation::Horizontal : Orientation::Vertical);
+            col.Orientation(Orientation::Horizontal);
             col.VerticalAlignment(VerticalAlignment::Center);
             col.Margin({(double)accountMargin, 0, (double)accountMargin, 0});
             col.Background(SolidColorBrush(winrt::Windows::UI::Color{0, 0, 0, 0}));
@@ -3371,6 +3599,27 @@ static Grid BuildQuotaGrid(QuotaUiInstance& state) {
             col.Visibility(accounts[i].hidden ? Visibility::Collapsed : Visibility::Visible);
             AccountUiRefs refs;
             refs.column = col;
+
+            if (showServiceStatus && ProviderServiceStatusIndex(accounts[i].provider) >= 0) {
+                double dotSize = std::clamp(barThickness * 0.9, 6.0, 10.0);
+                Border statusDot;
+                statusDot.Width(dotSize);
+                statusDot.Height(dotSize);
+                statusDot.CornerRadius({dotSize / 2, dotSize / 2, dotSize / 2, dotSize / 2});
+                statusDot.VerticalAlignment(VerticalAlignment::Center);
+                statusDot.Margin({0, 0, (double)std::max(labelGap, 2), 0});
+                statusDot.Background(
+                    SolidColorBrush(winrt::Windows::UI::Color{255, 0x9E, 0x9E, 0x9E}));
+                statusDot.IsHitTestVisible(false);
+                swprintf(name, ARRAYSIZE(name), L"AiQuota_Status_%d", (int)i);
+                statusDot.Name(name);
+                refs.serviceStatusDot = statusDot;
+                col.Children().Append(statusDot);
+            }
+
+            StackPanel section;
+            section.Orientation(labelOnLeft ? Orientation::Horizontal : Orientation::Vertical);
+            section.VerticalAlignment(VerticalAlignment::Center);
 
             if (showLabels) {
                 TextBlock label;
@@ -3384,7 +3633,7 @@ static Grid BuildQuotaGrid(QuotaUiInstance& state) {
                 swprintf(name, ARRAYSIZE(name), L"AiQuota_Label_%d", (int)i);
                 label.Name(name);
                 refs.label = label;
-                col.Children().Append(label);
+                section.Children().Append(label);
             }
 
             StackPanel bars;
@@ -3477,7 +3726,8 @@ static Grid BuildQuotaGrid(QuotaUiInstance& state) {
                 bars.Children().Append(slot);
             }
 
-            col.Children().Append(bars);
+            section.Children().Append(bars);
+            col.Children().Append(section);
 
             ToolTip toolTip;
             toolTip.Placement(wuxcp::PlacementMode::Top);
@@ -3753,8 +4003,8 @@ static void UpdateQuotaUi(QuotaUiInstance& state) {
 
     std::vector<AccountConfig> accounts;
     int intervalMin, barLength, yellowThreshold, orangeThreshold, redThreshold;
-    bool showPercentText, showCodexSparkInTooltip, showModelWeeklyBar, colorblindMode,
-        showStaleWarning;
+    bool showPercentText, showCodexSparkInTooltip, showModelWeeklyBar, showServiceStatus,
+        colorblindMode, showStaleWarning;
     BarLayout barLayout;
     BarMode barMode;
     ClickAction clickAction;
@@ -3772,14 +4022,17 @@ static void UpdateQuotaUi(QuotaUiInstance& state) {
         showPercentText = g_settings.showPercentText;
         showCodexSparkInTooltip = g_settings.showCodexSparkInTooltip;
         showModelWeeklyBar = g_settings.showModelWeeklyBar;
+        showServiceStatus = g_settings.showServiceStatus;
         colorblindMode = g_settings.colorblindMode;
         showStaleWarning = g_settings.showStaleWarning;
     }
 
     std::vector<AccountData> data;
+    std::array<ServiceStatusData, kServiceStatusCount> serviceStatuses;
     {
         std::lock_guard<std::mutex> lk(g_dataMutex);
         data = g_data;
+        serviceStatuses = g_serviceStatuses;
     }
     if (data.size() != accounts.size()) return;
     if (state.accountRefs.size() != data.size()) return;
@@ -3816,6 +4069,28 @@ static void UpdateQuotaUi(QuotaUiInstance& state) {
             bool stale = d.stale || d.lastSuccessMs == 0 || now - d.lastSuccessMs > staleAfterMs;
             bool warn = showStaleWarning && stale && !d.error.empty();
             bool accountRefreshing = refreshing && (refreshAccountIndex < 0 || refreshAccountIndex == (int)i);
+
+            int serviceStatusIndex = ProviderServiceStatusIndex(accounts[i].provider);
+            const ServiceStatusData* serviceStatus =
+                showServiceStatus && serviceStatusIndex >= 0
+                    ? &serviceStatuses[serviceStatusIndex]
+                    : nullptr;
+            bool serviceStatusStale = serviceStatus &&
+                                      (serviceStatus->lastSuccessMs == 0 ||
+                                       now - serviceStatus->lastSuccessMs > 15ULL * 60000);
+            if (serviceStatus && ui.serviceStatusDot) {
+                ServiceStatusLevel statusLevel = serviceStatusStale
+                                                       ? ServiceStatusLevel::Unknown
+                                                       : serviceStatus->level;
+                auto statusColor = ServiceStatusColor(statusLevel, colorblindMode);
+                uint32_t statusColorValue = ((uint32_t)statusColor.A << 24) |
+                                            ((uint32_t)statusColor.R << 16) |
+                                            ((uint32_t)statusColor.G << 8) | statusColor.B;
+                if (statusColorValue != ap.serviceStatusColor) {
+                    ui.serviceStatusDot.Background(SolidColorBrush(statusColor));
+                    ap.serviceStatusColor = statusColorValue;
+                }
+            }
 
             for (int w = 0; w < kWindowCount; w++) {
                 const WindowUsage& wu = d.windows[w];
@@ -3860,6 +4135,12 @@ static void UpdateQuotaUi(QuotaUiInstance& state) {
                                  !showCodexSparkInTooltip;
             if (!d.plan.empty() && !hideSparkPlan) {
                 tip += L" (" + d.plan + L")";
+            }
+            if (serviceStatus) {
+                tip += L"\nstatus: ";
+                tip += serviceStatusStale || serviceStatus->description.empty()
+                           ? L"Unavailable"
+                           : serviceStatus->description;
             }
             wchar_t line[160];
             if (d.windows[kWin5h].pct >= 0) {
@@ -4384,6 +4665,7 @@ static void LoadSettings() {
     s.showPercentText = getBoolSetting(L"showPercentText", false);
     s.showCodexSparkInTooltip = getBoolSetting(L"showCodexSparkInTooltip", false);
     s.showModelWeeklyBar = getBoolSetting(L"showModelWeeklyBar", true);
+    s.showServiceStatus = getBoolSetting(L"showServiceStatus", false);
     s.colorblindMode = getBoolSetting(L"colorblindMode", false);
     s.showStaleWarning = getBoolSetting(L"showStaleWarning", true);
     s.enableNotifications = getBoolSetting(L"enableNotifications", true);

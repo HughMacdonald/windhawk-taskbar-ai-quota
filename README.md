@@ -22,6 +22,10 @@ Hover for exact percentages and reset times. Click a column to refresh that acco
 
 Bars use configurable green/yellow/orange/red thresholds, with an optional colorblind palette. Stale errors can mark labels and tooltips with `!`.
 
+An optional status dot beside each Anthropic/OpenAI account shows the current Claude Code
+status or a roll-up of OpenAI's Codex components. Green means operational, yellow degraded,
+orange a partial outage, red a major outage, blue maintenance, and grey unavailable.
+
 It can also fire a Windows notification when an account first crosses the red threshold (5-hour or weekly), so you don't have to keep glancing at the bars. The notification re-arms once usage drops back below the threshold.
 
 ## Setup
@@ -53,6 +57,7 @@ Useful settings include:
 - compact percent text (each bar labelled with its own percentage)
 - percent text size (auto-fits the bar by default, or set an explicit size)
 - model weekly bar (third bar for a model-scoped weekly limit such as Fable)
+- service status dots (Claude Code for Anthropic and rolled-up Codex status for OpenAI)
 - click action: refresh account or open provider dashboard (Antigravity always refreshes)
 - cloud poll interval (Antigravity polls its local server every minute)
 - taskbar monitor mode: primary, all, or specific monitor number (`1` = primary, `2+` = secondary taskbars)
