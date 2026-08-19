@@ -22,6 +22,11 @@ Hover for exact percentages and reset times. Click a column to refresh that acco
 
 Bars use configurable green/yellow/orange/red thresholds, with an optional colorblind palette. Stale errors can mark labels and tooltips with `!`.
 
+An optional time-progress tick on each bar shows how far through that quota window's
+current reset period it is. It advances in Used mode and counts down in Remaining mode;
+the tooltip includes the exact percentage. An optional auto-adjustment moves percent text
+aside as the tick passes through the center of a bar.
+
 An optional status dot beside each Anthropic/OpenAI account shows the current Claude Code
 status or a roll-up of OpenAI's Codex components. Green means operational, yellow degraded,
 orange a partial outage, red a major outage, blue maintenance, and grey unavailable.
@@ -52,9 +57,11 @@ Useful settings include:
 - account labels
 - bar length, thickness, and layout
 - bar mode: used (fills as quota is consumed) or remaining (fills with quota left, tooltips show "X% remaining")
+- time-progress markers showing how far through each quota reset period it is
 - label position and font size
 - account, label, bar, and tray spacing
 - compact percent text (each bar labelled with its own percentage)
+- automatic percent-text positioning to avoid the time-progress tick
 - percent text size (auto-fits the bar by default, or set an explicit size)
 - model weekly bar (third bar for a model-scoped weekly limit such as Fable)
 - service status dots (Claude Code for Anthropic and rolled-up Codex status for OpenAI)

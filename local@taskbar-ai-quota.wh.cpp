@@ -38,6 +38,10 @@ one account always stays visible).
 Bars use configurable green/yellow/orange/red thresholds, with a colorblind palette option.
 Stale errors can mark labels/tooltips with `!`.
 
+An optional time-progress tick on each bar shows how far through that quota window's
+current reset period it is, advancing in Used mode and counting down in Remaining mode.
+Percent text can optionally move aside as the tick passes through the center of its bar.
+
 An optional status dot beside each Anthropic/OpenAI account shows the current Claude Code
 component status from status.claude.com or rolled-up Codex status from status.openai.com.
 
@@ -119,6 +123,9 @@ Have a suggestion or found a bug?
   $options:
     - used: Used
     - remaining: Remaining
+- showTimeProgress: false
+  $name: Show time progress
+  $description: 'Default: false. Shows a thin marker on each bar indicating elapsed or remaining time, following Bar mode.'
 - showLabels: true
   $name: Show labels
   $description: 'Default: true'
@@ -143,6 +150,9 @@ Have a suggestion or found a bug?
 - showPercentText: false
   $name: Show percent text
   $description: 'Default: false. Shows each window''s percentage over its own bar.'
+- autoAdjustPercentTextPosition: false
+  $name: Auto-adjust percent text position
+  $description: 'Default: false. When percent text and time progress are shown, moves the percent text aside so the time tick does not overlap it.'
 - percentFontSize: 0
   $name: Percent text size (px)
   $description: 'Default: 0 (auto). Auto follows the label font size and shrinks to fit the bar. Set 6-24 to force a size; text bigger than the bar renders outside it and may overlap neighbouring bars, which keep their spacing.'
@@ -287,6 +297,8 @@ struct Settings {
     bool showLabels = true;
     bool labelOnLeft = true;
     bool showPercentText = false;
+    bool autoAdjustPercentTextPosition = false;
+    bool showTimeProgress = false;
     bool showCodexSparkInTooltip = false;
     bool showModelWeeklyBar = true;
     bool showServiceStatus = false;
@@ -298,6 +310,7 @@ struct Settings {
 struct WindowUsage {
     double pct = -1;
     ULONGLONG resetUnixMs = 0;
+    ULONGLONG durationMs = 0;
 };
 
 // Bar slots per account column. kWinScoped is a model-scoped weekly limit (e.g. Fable)
@@ -308,6 +321,9 @@ enum WindowSlot {
     kWinScoped = 2,
     kWindowCount = 3,
 };
+
+static constexpr ULONGLONG kFiveHourWindowMs = 5ULL * 60 * 60 * 1000;
+static constexpr ULONGLONG kWeeklyWindowMs = 7ULL * 24 * 60 * 60 * 1000;
 
 struct AccountData {
     std::array<WindowUsage, kWindowCount> windows;
@@ -344,6 +360,8 @@ struct AppliedState {
     int fillPx[kWindowCount] = {-1, -1, -1};
     uint32_t fillColor[kWindowCount] = {0, 0, 0};
     int barVisible[kWindowCount] = {-1, -1, -1};  // -1 unset, 0 collapsed, 1 visible.
+    int timeProgressPx[kWindowCount] = {-1, -1, -1};
+    int timeProgressVisible[kWindowCount] = {-1, -1, -1};
     std::wstring tip;
     std::wstring percentText[kWindowCount];
     std::wstring labelText;
@@ -379,6 +397,12 @@ struct AccountUiRefs {
                                                         FrameworkElement{nullptr},
                                                         FrameworkElement{nullptr}};
     std::array<Border, kWindowCount> fills{Border{nullptr}, Border{nullptr}, Border{nullptr}};
+    std::array<Border, kWindowCount> timeProgressMarkers{Border{nullptr}, Border{nullptr},
+                                                         Border{nullptr}};
+    std::array<Border, kWindowCount> percentPills{Border{nullptr}, Border{nullptr},
+                                                  Border{nullptr}};
+    std::array<TranslateTransform, kWindowCount> percentTransforms{
+        TranslateTransform{nullptr}, TranslateTransform{nullptr}, TranslateTransform{nullptr}};
     std::array<TextBlock, kWindowCount> percents{TextBlock{nullptr}, TextBlock{nullptr},
                                                  TextBlock{nullptr}};
     Border serviceStatusDot{nullptr};
@@ -586,6 +610,49 @@ static std::wstring FormatReset(ULONGLONG unixMs) {
     wchar_t day[16] = L"";
     GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, &local, L"ddd", day, ARRAYSIZE(day), nullptr);
     return std::wstring(rel) + L" (" + day + L" " + localTime + L")";
+}
+
+static double WindowTimeElapsedPct(const WindowUsage& usage, ULONGLONG nowUnixMs) {
+    if (!usage.resetUnixMs || !usage.durationMs) return -1;
+
+    LONGLONG periodStartMs = (LONGLONG)usage.resetUnixMs - (LONGLONG)usage.durationMs;
+    double elapsed = (double)((LONGLONG)nowUnixMs - periodStartMs) /
+                     (double)usage.durationMs * 100.0;
+    return std::clamp(elapsed, 0.0, 100.0);
+}
+
+static std::wstring FormatWindowTimeProgress(const WindowUsage& usage, ULONGLONG nowUnixMs,
+                                             BarMode barMode) {
+    double elapsedPct = WindowTimeElapsedPct(usage, nowUnixMs);
+    if (elapsedPct < 0) return {};
+
+    wchar_t text[48];
+    if (barMode == BarMode::Remaining) {
+        swprintf(text, ARRAYSIZE(text), L" | period %.0f%% remaining", 100.0 - elapsedPct);
+    } else {
+        swprintf(text, ARRAYSIZE(text), L" | period %.0f%% elapsed", elapsedPct);
+    }
+    return text;
+}
+
+static double PercentTickAvoidanceOffset(double markerPx, double barLength,
+                                         double pillExtent) {
+    if (barLength <= 0 || pillExtent <= 0) return 0;
+
+    constexpr double gap = 2.0;
+    double center = barLength / 2.0;
+    double halfPill = pillExtent / 2.0;
+    // At the exact midpoint, keep the text on the right; switch to the left only
+    // once the tick has moved beyond center.
+    if (markerPx <= center) {
+        if (markerPx + gap <= center - halfPill) return 0;
+        double desiredCenter = markerPx + gap + halfPill;
+        return desiredCenter - center;
+    }
+
+    if (markerPx - gap >= center + halfPill) return 0;
+    double desiredCenter = markerPx - gap - halfPill;
+    return desiredCenter - center;
 }
 
 static std::wstring FormatUpdated(ULONGLONG unixMs, bool stale) {
@@ -2097,10 +2164,12 @@ static bool ParseAnthropicUsage(const std::string& body, AccountData* d, std::ws
         if (auto fh = GetObj(usage, L"five_hour")) {
             d->windows[kWin5h].pct = GetNum(fh, L"utilization");
             d->windows[kWin5h].resetUnixMs = ParseIso8601Ms(GetStr(fh, L"resets_at"));
+            d->windows[kWin5h].durationMs = kFiveHourWindowMs;
         }
         if (auto sd = GetObj(usage, L"seven_day")) {
             d->windows[kWinWeek].pct = GetNum(sd, L"utilization");
             d->windows[kWinWeek].resetUnixMs = ParseIso8601Ms(GetStr(sd, L"resets_at"));
+            d->windows[kWinWeek].durationMs = kWeeklyWindowMs;
         }
 
         // Model-scoped weekly limit (e.g. Fable) only appears in the newer "limits" array:
@@ -2119,6 +2188,7 @@ static bool ParseAnthropicUsage(const std::string& body, AccountData* d, std::ws
                     if (name.empty() || pct < 0) continue;
                     d->windows[kWinScoped].pct = pct;
                     d->windows[kWinScoped].resetUnixMs = ParseIso8601Ms(GetStr(lim, L"resets_at"));
+                    d->windows[kWinScoped].durationMs = kWeeklyWindowMs;
                     d->scopedWindowLabel = std::move(name);
                     break;
                 }
@@ -2203,6 +2273,11 @@ static bool ParseOpenAiUsage(const std::string& body, AccountData* d, std::wstri
             if (pct < 0) return;
             target->pct = pct;
             target->resetUnixMs = resetUnixMs(window);
+            target->durationMs = windowSeconds > 0
+                                     ? (ULONGLONG)(windowSeconds * 1000)
+                                     : (target == &d->windows[kWin5h]
+                                            ? kFiveHourWindowMs
+                                            : kWeeklyWindowMs);
         };
 
         applyWindow(GetObj(rl, L"primary_window"), &d->windows[kWin5h]);
@@ -2622,9 +2697,11 @@ static bool ParseAntigravityQuotaSummary(const std::string& body, AccountData* d
                 if (is5h) {
                     d->windows[kWin5h].pct = usedPct;
                     d->windows[kWin5h].resetUnixMs = resetMs;
+                    d->windows[kWin5h].durationMs = kFiveHourWindowMs;
                 } else {
                     d->windows[kWinWeek].pct = usedPct;
                     d->windows[kWinWeek].resetUnixMs = resetMs;
+                    d->windows[kWinWeek].durationMs = kWeeklyWindowMs;
                 }
                 parsed = true;
             }
@@ -2970,7 +3047,7 @@ static DWORD WINAPI FetchThreadProc(LPVOID) {
         int refreshAccountIndex = g_refreshAccountIndex.load();
         std::vector<AccountConfig> accounts;
         int intervalMin, redThreshold;
-        bool enableNotifications, showModelWeeklyBar, showServiceStatus;
+        bool enableNotifications, showModelWeeklyBar, showServiceStatus, showTimeProgress;
         ULONGLONG settingsGeneration;
         {
             std::lock_guard<std::mutex> lk(g_settingsMutex);
@@ -2980,6 +3057,7 @@ static DWORD WINAPI FetchThreadProc(LPVOID) {
             enableNotifications = g_settings.enableNotifications;
             showModelWeeklyBar = g_settings.showModelWeeklyBar;
             showServiceStatus = g_settings.showServiceStatus;
+            showTimeProgress = g_settings.showTimeProgress;
             settingsGeneration = g_settingsGeneration;
         }
         bool settingsChanged = lastLoggedSettingsGeneration != settingsGeneration ||
@@ -3174,6 +3252,8 @@ static DWORD WINAPI FetchThreadProc(LPVOID) {
         }
 
         DWORD waitMs = (DWORD)intervalMin * 60000;
+        // Keep elapsed-time markers reasonably current without making another quota request.
+        if (showTimeProgress) waitMs = std::min(waitMs, (DWORD)60000);
         if (anyError) waitMs = std::min(waitMs, (DWORD)120000);
         ULONGLONG nowMs = NowUnixMs();
         if (nextRetryMs > nowMs) {
@@ -3535,7 +3615,7 @@ static Grid BuildQuotaGrid(QuotaUiInstance& state) {
         std::vector<AccountConfig> accounts;
         int barLength, barThickness, labelFontSize, percentFontSetting, accountMargin, labelGap,
             barGap, rightMargin;
-        bool showLabels, labelOnLeft, showPercentText, showServiceStatus;
+        bool showLabels, labelOnLeft, showPercentText, showServiceStatus, showTimeProgress;
         BarLayout barLayout;
         ClickAction clickAction;
         {
@@ -3555,6 +3635,7 @@ static Grid BuildQuotaGrid(QuotaUiInstance& state) {
             labelOnLeft = g_settings.labelOnLeft;
             showPercentText = g_settings.showPercentText;
             showServiceStatus = g_settings.showServiceStatus;
+            showTimeProgress = g_settings.showTimeProgress;
         }
         state.accountRefs.clear();
         if (accounts.empty()) return nullptr;
@@ -3669,6 +3750,10 @@ static Grid BuildQuotaGrid(QuotaUiInstance& state) {
                 track.VerticalAlignment(VerticalAlignment::Center);
                 track.Background(SolidColorBrush(winrt::Windows::UI::Color{0x46, 0x80, 0x80, 0x80}));
 
+                Grid barVisual;
+                barVisual.Width(verticalBars ? barThickness : barLength);
+                barVisual.Height(verticalBars ? barLength : barThickness);
+
                 Border fill;
                 fill.Height(verticalBars ? 0 : barThickness);
                 fill.Width(verticalBars ? barThickness : 0);
@@ -3679,8 +3764,30 @@ static Grid BuildQuotaGrid(QuotaUiInstance& state) {
                 swprintf(name, ARRAYSIZE(name), L"AiQuota_Fill_%d_%d", (int)i, w);
                 fill.Name(name);
                 refs.fills[w] = fill;
+                // Panel children paint in append order: the fill is the bottom layer.
+                barVisual.Children().Append(fill);
 
-                track.Child(fill);
+                if (showTimeProgress) {
+                    Border marker;
+                    marker.Width(verticalBars ? barThickness : 2);
+                    marker.Height(verticalBars ? 2 : barThickness);
+                    marker.CornerRadius({1, 1, 1, 1});
+                    marker.HorizontalAlignment(verticalBars ? HorizontalAlignment::Center
+                                                            : HorizontalAlignment::Left);
+                    marker.VerticalAlignment(verticalBars ? VerticalAlignment::Bottom
+                                                          : VerticalAlignment::Center);
+                    marker.Background(SolidColorBrush(
+                        winrt::Windows::UI::Color{0xFF, 0xFF, 0xFF, 0xFF}));
+                    marker.IsHitTestVisible(false);
+                    marker.Visibility(Visibility::Collapsed);
+                    swprintf(name, ARRAYSIZE(name), L"AiQuota_Time_%d_%d", (int)i, w);
+                    marker.Name(name);
+                    refs.timeProgressMarkers[w] = marker;
+                    // Appended after the fill, so the marker paints on top of the bar.
+                    barVisual.Children().Append(marker);
+                }
+
+                track.Child(barVisual);
 
                 FrameworkElement slot{nullptr};
                 if (showPercentText) {
@@ -3705,14 +3812,39 @@ static Grid BuildQuotaGrid(QuotaUiInstance& state) {
                     // the bars apart. Overhang scales with the font so it always has room.
                     double overhangX = percentFontSize * 2.0;
                     double overhangY = percentFontSize;
-                    percent.Margin({-overhangX, -overhangY, -overhangX, -overhangY});
+
                     percent.Foreground(SolidColorBrush(winrt::Windows::UI::Color{255, 255, 255, 255}));
                     percent.Opacity(0.9);
                     percent.IsHitTestVisible(false);
                     swprintf(name, ARRAYSIZE(name), L"AiQuota_Percent_%d_%d", (int)i, w);
                     percent.Name(name);
                     refs.percents[w] = percent;
-                    cell.Children().Append(percent);
+
+                    Border percentPill;
+                    percentPill.HorizontalAlignment(HorizontalAlignment::Center);
+                    percentPill.VerticalAlignment(VerticalAlignment::Center);
+                    percentPill.Margin({-overhangX, 0, -overhangX, 0});
+                    if (!verticalBars) {
+                        // Keep the background exactly within the horizontal bar while the
+                        // negative text margin still lets an oversized font render uncropped.
+                        percentPill.Height(barThickness);
+                        percent.Margin({0, -overhangY, 0, -overhangY});
+                    }
+                    percentPill.Padding({2, 0, 2, 0});
+                    percentPill.CornerRadius({2, 2, 2, 2});
+                    percentPill.Background(SolidColorBrush(
+                        winrt::Windows::UI::Color{0x80, 0x00, 0x00, 0x00}));
+                    percentPill.IsHitTestVisible(false);
+                    percentPill.Visibility(Visibility::Collapsed);
+                    percentPill.Child(percent);
+                    refs.percentPills[w] = percentPill;
+
+                    TranslateTransform percentTransform;
+                    percentPill.RenderTransform(percentTransform);
+                    refs.percentTransforms[w] = percentTransform;
+                    // The track contains both fill and marker; appending this pill after it
+                    // keeps the dark background and its white text above every bar layer.
+                    cell.Children().Append(percentPill);
 
                     slot = cell;
                 } else {
@@ -4003,8 +4135,9 @@ static void UpdateQuotaUi(QuotaUiInstance& state) {
 
     std::vector<AccountConfig> accounts;
     int intervalMin, barLength, yellowThreshold, orangeThreshold, redThreshold;
-    bool showPercentText, showCodexSparkInTooltip, showModelWeeklyBar, showServiceStatus,
-        colorblindMode, showStaleWarning;
+    bool showPercentText, autoAdjustPercentTextPosition, showTimeProgress,
+        showCodexSparkInTooltip, showModelWeeklyBar, showServiceStatus, colorblindMode,
+        showStaleWarning;
     BarLayout barLayout;
     BarMode barMode;
     ClickAction clickAction;
@@ -4020,6 +4153,8 @@ static void UpdateQuotaUi(QuotaUiInstance& state) {
         orangeThreshold = g_settings.orangeThreshold;
         redThreshold = g_settings.redThreshold;
         showPercentText = g_settings.showPercentText;
+        autoAdjustPercentTextPosition = g_settings.autoAdjustPercentTextPosition;
+        showTimeProgress = g_settings.showTimeProgress;
         showCodexSparkInTooltip = g_settings.showCodexSparkInTooltip;
         showModelWeeklyBar = g_settings.showModelWeeklyBar;
         showServiceStatus = g_settings.showServiceStatus;
@@ -4109,6 +4244,33 @@ static void UpdateQuotaUi(QuotaUiInstance& state) {
                 }
                 if (!showBar) continue;
 
+                if (ui.timeProgressMarkers[w]) {
+                    double elapsedPct = WindowTimeElapsedPct(wu, now);
+                    int markerVisible = elapsedPct >= 0 ? 1 : 0;
+                    if (markerVisible != ap.timeProgressVisible[w]) {
+                        ui.timeProgressMarkers[w].Visibility(
+                            markerVisible ? Visibility::Visible : Visibility::Collapsed);
+                        ap.timeProgressVisible[w] = markerVisible;
+                    }
+                    if (markerVisible) {
+                        double markerPct = barMode == BarMode::Remaining
+                                               ? 100.0 - elapsedPct
+                                               : elapsedPct;
+                        int progressPx = std::clamp(
+                            (int)std::lround(barLength * markerPct / 100.0), 1, barLength - 1);
+                        if (progressPx != ap.timeProgressPx[w]) {
+                            if (verticalBars) {
+                                ui.timeProgressMarkers[w].Margin(
+                                    {0, 0, 0, (double)progressPx - 1});
+                            } else {
+                                ui.timeProgressMarkers[w].Margin(
+                                    {(double)progressPx - 1, 0, 0, 0});
+                            }
+                            ap.timeProgressPx[w] = progressPx;
+                        }
+                    }
+                }
+
                 double dispPct = displayPct(wu.pct);
                 int px = dispPct > 0 ? std::clamp((int)std::lround(barLength * dispPct / 100.0), 2, barLength) : 0;
                 // Color stays keyed to actual usage so depleting quota still reds out.
@@ -4142,28 +4304,41 @@ static void UpdateQuotaUi(QuotaUiInstance& state) {
                            ? L"Unavailable"
                            : serviceStatus->description;
             }
-            wchar_t line[160];
+            wchar_t line[224];
             if (d.windows[kWin5h].pct >= 0) {
-                swprintf(line, ARRAYSIZE(line), L"\n5h: %.0f%%%s | resets %s",
+                std::wstring progress = showTimeProgress
+                                            ? FormatWindowTimeProgress(d.windows[kWin5h], now,
+                                                                       barMode)
+                                            : L"";
+                swprintf(line, ARRAYSIZE(line), L"\n5h: %.0f%%%s | resets %s%s",
                          displayPct(d.windows[kWin5h].pct), remainingSuffix,
-                         FormatReset(d.windows[kWin5h].resetUnixMs).c_str());
+                         FormatReset(d.windows[kWin5h].resetUnixMs).c_str(), progress.c_str());
                 tip += line;
             } else {
                 tip += L"\n5h: n/a";
             }
             if (d.windows[kWinWeek].pct >= 0) {
-                swprintf(line, ARRAYSIZE(line), L"\nweek: %.0f%%%s | resets %s",
+                std::wstring progress = showTimeProgress
+                                            ? FormatWindowTimeProgress(d.windows[kWinWeek], now,
+                                                                       barMode)
+                                            : L"";
+                swprintf(line, ARRAYSIZE(line), L"\nweek: %.0f%%%s | resets %s%s",
                          displayPct(d.windows[kWinWeek].pct), remainingSuffix,
-                         FormatReset(d.windows[kWinWeek].resetUnixMs).c_str());
+                         FormatReset(d.windows[kWinWeek].resetUnixMs).c_str(), progress.c_str());
                 tip += line;
             } else {
                 tip += L"\nweek: n/a";
             }
             if (showModelWeeklyBar && d.windows[kWinScoped].pct >= 0 &&
                 !d.scopedWindowLabel.empty()) {
-                swprintf(line, ARRAYSIZE(line), L"\n%s wk: %.0f%%%s | resets %s",
+                std::wstring progress = showTimeProgress
+                                            ? FormatWindowTimeProgress(d.windows[kWinScoped], now,
+                                                                       barMode)
+                                            : L"";
+                swprintf(line, ARRAYSIZE(line), L"\n%s wk: %.0f%%%s | resets %s%s",
                          d.scopedWindowLabel.c_str(), displayPct(d.windows[kWinScoped].pct),
-                         remainingSuffix, FormatReset(d.windows[kWinScoped].resetUnixMs).c_str());
+                         remainingSuffix, FormatReset(d.windows[kWinScoped].resetUnixMs).c_str(),
+                         progress.c_str());
                 tip += line;
             }
             if (showCodexSparkInTooltip && accounts[i].provider == L"openai" && !d.codexSparkLines.empty()) {
@@ -4212,8 +4387,40 @@ static void UpdateQuotaUi(QuotaUiInstance& state) {
                         percentText = text;
                     }
                     if (percentText != ap.percentText[w]) {
+                        if (ui.percentPills[w]) {
+                            ui.percentPills[w].Visibility(
+                                percentText.empty() ? Visibility::Collapsed : Visibility::Visible);
+                        }
                         if (ui.percents[w]) ui.percents[w].Text(percentText);
                         ap.percentText[w] = std::move(percentText);
+                    }
+
+                    if (ui.percentTransforms[w]) {
+                        double offset = 0;
+                        if (autoAdjustPercentTextPosition && !ap.percentText[w].empty() &&
+                            ap.timeProgressVisible[w] == 1 && ui.percentPills[w]) {
+                            // Make a newly changed label measurable before calculating the
+                            // collision boundary. This avoids a one-frame overlap on first paint.
+                            ui.percentPills[w].UpdateLayout();
+                            double pillExtent = verticalBars ? ui.percentPills[w].ActualHeight()
+                                                             : ui.percentPills[w].ActualWidth();
+                            // Actual size can be zero during the first layout pass. Estimate it
+                            // so the first painted frame still avoids the tick; a later update
+                            // replaces this with XAML's measured size.
+                            if (pillExtent <= 0) {
+                                double fontSize = ui.percents[w] ? ui.percents[w].FontSize() : 11.0;
+                                pillExtent = verticalBars
+                                                 ? fontSize * 1.35
+                                                 : ap.percentText[w].size() * fontSize * 0.62 + 4.0;
+                            }
+                            offset = PercentTickAvoidanceOffset(
+                                ap.timeProgressPx[w], barLength, pillExtent);
+                        }
+
+                        // PercentTickAvoidanceOffset uses a bottom-to-top progress axis for
+                        // vertical bars, while positive XAML Y moves downward.
+                        ui.percentTransforms[w].X(verticalBars ? 0 : offset);
+                        ui.percentTransforms[w].Y(verticalBars ? -offset : 0);
                     }
                 }
             }
@@ -4663,6 +4870,9 @@ static void LoadSettings() {
     s.showLabels = getBoolSetting(L"showLabels", true);
     s.labelOnLeft = getBoolSetting(L"labelOnLeft", true);
     s.showPercentText = getBoolSetting(L"showPercentText", false);
+    s.autoAdjustPercentTextPosition =
+        getBoolSetting(L"autoAdjustPercentTextPosition", false);
+    s.showTimeProgress = getBoolSetting(L"showTimeProgress", false);
     s.showCodexSparkInTooltip = getBoolSetting(L"showCodexSparkInTooltip", false);
     s.showModelWeeklyBar = getBoolSetting(L"showModelWeeklyBar", true);
     s.showServiceStatus = getBoolSetting(L"showServiceStatus", false);
