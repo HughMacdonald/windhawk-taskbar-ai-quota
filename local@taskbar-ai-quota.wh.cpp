@@ -30,7 +30,7 @@ Bars adapt to what the provider reports: windows with no data are hidden once a 
 succeeds, and Anthropic accounts gain a third bar for a model-scoped weekly limit
 (e.g. Fable) when the API reports one.
 
-Hover for exact percentages and reset times. Click a column to refresh that account
+Hover for percentages and reset times. Click a column to refresh that account
 or open its provider dashboard, depending on settings and provider support. Right-click
 for Refresh all, provider actions, and a checkbox list to show/hide individual accounts. Hidden accounts
 stop updating and are left to go stale; the choice persists across restarts (at least
@@ -42,8 +42,8 @@ An optional time-progress tick on each bar shows how far through that quota wind
 current reset period it is, advancing in Used mode and counting down in Remaining mode.
 Percent text can optionally move aside as the tick passes through the center of its bar.
 
-An optional status dot beside each Anthropic/OpenAI account shows the current Claude Code
-component status from status.claude.com or rolled-up Codex status from status.openai.com.
+An optional status dot beside each Anthropic/OpenAI account shows the worst current status
+across all components reported by that provider's status page.
 
 Optionally fires a Windows notification when an account first crosses the red threshold
 (5-hour or weekly), so you don't have to keep glancing at the bars.
@@ -143,7 +143,7 @@ Have a suggestion or found a bug?
   $description: 'Default: 3. Gap between label and bars.'
 - barGap: 2
   $name: Bar gap (px)
-  $description: 'Default: 2. Gap between the two quota bars.'
+  $description: 'Default: 2. Gap between quota bars.'
 - rightMargin: 4
   $name: Right tray gap (px)
   $description: 'Default: 4. Gap between quota bars and the system tray side.'
@@ -164,7 +164,7 @@ Have a suggestion or found a bug?
   $description: 'Default: true. Shows a third bar for a model-scoped weekly limit (e.g. Fable) when Anthropic reports one.'
 - showServiceStatus: false
   $name: Show service status
-  $description: 'Default: false. Shows a coloured status dot beside each account: Claude Code status for Anthropic and rolled-up Codex status for OpenAI.'
+  $description: 'Default: false. Shows a coloured status dot beside each Anthropic/OpenAI account based on the worst status across all components reported by that provider.'
 - yellowThreshold: 50
   $name: Yellow threshold (%)
   $description: 'Default: 50. Usage below this stays green.'
@@ -636,7 +636,7 @@ static std::wstring FormatWindowTimeProgress(const WindowUsage& usage, ULONGLONG
 }
 
 static double PercentTickAvoidanceOffset(double markerPx, double barLength,
-                                         double pillExtent) {
+                                         double pillExtent, bool tickAtOrBeforeMidpoint) {
     if (barLength <= 0 || pillExtent <= 0) return 0;
 
     constexpr double gap = 2.0;
@@ -644,7 +644,7 @@ static double PercentTickAvoidanceOffset(double markerPx, double barLength,
     double halfPill = pillExtent / 2.0;
     // At the exact midpoint, keep the text on the right; switch to the left only
     // once the tick has moved beyond center.
-    if (markerPx <= center) {
+    if (tickAtOrBeforeMidpoint) {
         if (markerPx + gap <= center - halfPill) return 0;
         double desiredCenter = markerPx + gap + halfPill;
         return desiredCenter - center;
@@ -777,6 +777,12 @@ static void UpdateQuotaToolTip(ToolTip const& toolTip, std::wstring const& tip, 
             } else if (line.rfind(L"week:", 0) == 0) {
                 labelBrush = quotaLabel;
                 labelEnd = 5;
+                labelBold = true;
+                quotaLine = true;
+            } else if (size_t wkLabelEnd = line.find(L" wk:");
+                       wkLabelEnd != std::wstring::npos) {
+                labelBrush = quotaLabel;
+                labelEnd = wkLabelEnd + 4;
                 labelBold = true;
                 quotaLine = true;
             } else if (line.rfind(L"error:", 0) == 0) {
@@ -1493,37 +1499,26 @@ static ServiceStatusData FetchServiceStatus(int providerIndex) {
             return result;
         }
 
-        static constexpr std::array<PCWSTR, 4> kOpenAiCodexComponents = {
-            L"Codex Web", L"Codex API", L"CLI", L"VS Code extension"};
         JsonArray components = root.GetNamedArray(L"components");
-        int matchedComponents = 0;
+        int componentCount = 0;
         for (uint32_t i = 0; i < components.Size(); i++) {
             if (components.GetAt(i).ValueType() != JsonValueType::Object) continue;
             JsonObject component = components.GetObjectAt(i);
-            std::wstring name = GetStr(component, L"name");
-            bool matches = providerIndex == 0 && _wcsicmp(name.c_str(), L"Claude Code") == 0;
-            if (providerIndex == 1) {
-                matches = std::any_of(kOpenAiCodexComponents.begin(),
-                                      kOpenAiCodexComponents.end(), [&](PCWSTR candidate) {
-                    return _wcsicmp(name.c_str(), candidate) == 0;
-                });
-            }
-            if (!matches) continue;
-
-            matchedComponents++;
+            componentCount++;
             ServiceStatusLevel level =
                 ParseServiceStatusLevel(GetStr(component, L"status"), L"");
             if (level == ServiceStatusLevel::Unknown) {
                 result.error = L"unknown component status";
                 return result;
             }
+            // ServiceStatusLevel is ordered by severity, so the worst component wins.
             if ((int)level > (int)result.level) result.level = level;
         }
-        if (matchedComponents == 0) {
-            result.error = L"component not found";
+        if (componentCount == 0) {
+            result.error = L"no components found";
             return result;
         }
-        result.description = std::wstring(providerIndex == 0 ? L"Claude Code: " : L"Codex: ") +
+        result.description = std::wstring(providerIndex == 0 ? L"Anthropic: " : L"OpenAI: ") +
                              ServiceStatusLevelDescription(result.level);
         result.lastSuccessMs = NowUnixMs();
     } catch (...) {
@@ -3104,16 +3099,24 @@ static DWORD WINAPI FetchThreadProc(LPVOID) {
             (manualRefresh || nextServiceStatusPollMs == 0 ||
              nextServiceStatusPollMs <= statusNowMs)) {
             static constexpr std::array<PCWSTR, kServiceStatusCount> kStatusNames = {
-                L"Claude Code", L"Codex"};
+                L"Anthropic", L"OpenAI"};
             for (int i = 0; i < kServiceStatusCount && !g_unloading; i++) {
                 if (!serviceStatusNeeded[i]) continue;
-                serviceStatuses[i] = FetchServiceStatus(i);
-                if (serviceStatuses[i].error != lastLoggedServiceStatusErrors[i]) {
-                    if (!serviceStatuses[i].error.empty()) {
+                ServiceStatusData fetchedStatus = FetchServiceStatus(i);
+                std::wstring fetchError = fetchedStatus.error;
+                if (fetchError.empty()) {
+                    serviceStatuses[i] = std::move(fetchedStatus);
+                } else {
+                    // Preserve the last known status so a transient fetch failure only turns
+                    // the dot unavailable after UpdateQuotaUi's 15-minute stale threshold.
+                    serviceStatuses[i].error = fetchError;
+                }
+                if (fetchError != lastLoggedServiceStatusErrors[i]) {
+                    if (!fetchError.empty()) {
                         Wh_Log(L"Status fetch (%s): %s", kStatusNames[i],
-                               serviceStatuses[i].error.c_str());
+                               fetchError.c_str());
                     }
-                    lastLoggedServiceStatusErrors[i] = serviceStatuses[i].error;
+                    lastLoggedServiceStatusErrors[i] = std::move(fetchError);
                 }
             }
             nextServiceStatusPollMs = NowUnixMs() + 5ULL * 60000;
@@ -4413,8 +4416,12 @@ static void UpdateQuotaUi(QuotaUiInstance& state) {
                                                  ? fontSize * 1.35
                                                  : ap.percentText[w].size() * fontSize * 0.62 + 4.0;
                             }
+                            double elapsedPct = WindowTimeElapsedPct(d.windows[w], now);
+                            double markerPct = barMode == BarMode::Remaining
+                                                   ? 100.0 - elapsedPct
+                                                   : elapsedPct;
                             offset = PercentTickAvoidanceOffset(
-                                ap.timeProgressPx[w], barLength, pillExtent);
+                                ap.timeProgressPx[w], barLength, pillExtent, markerPct <= 50.0);
                         }
 
                         // PercentTickAvoidanceOffset uses a bottom-to-top progress axis for

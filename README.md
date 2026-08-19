@@ -18,18 +18,19 @@ hidden (e.g. an OpenAI account with no 5-hour window shows a single weekly bar),
 Anthropic accounts gain a third bar for a model-scoped weekly limit (e.g. Fable) when
 the API reports one.
 
-Hover for exact percentages and reset times. Click a column to refresh that account or open its provider dashboard, depending on settings and provider support. Right-click a column for Refresh all, provider actions, and show/hide toggles.
+Hover for percentages and reset times. Click a column to refresh that account or open its provider dashboard, depending on settings and provider support. Right-click a column for Refresh all, provider actions, and show/hide toggles.
 
 Bars use configurable green/yellow/orange/red thresholds, with an optional colorblind palette. Stale errors can mark labels and tooltips with `!`.
 
 An optional time-progress tick on each bar shows how far through that quota window's
 current reset period it is. It advances in Used mode and counts down in Remaining mode;
-the tooltip includes the exact percentage. An optional auto-adjustment moves percent text
+the tooltip includes the current percentage. An optional auto-adjustment moves percent text
 aside as the tick passes through the center of a bar.
 
-An optional status dot beside each Anthropic/OpenAI account shows the current Claude Code
-status or a roll-up of OpenAI's Codex components. Green means operational, yellow degraded,
-orange a partial outage, red a major outage, blue maintenance, and grey unavailable.
+An optional status dot beside each Anthropic/OpenAI account shows the worst current status
+across all components reported by that provider's status page. Green means operational,
+yellow degraded, orange a partial outage, red a major outage, blue maintenance, and grey
+unavailable.
 
 It can also fire a Windows notification when an account first crosses the red threshold (5-hour or weekly), so you don't have to keep glancing at the bars. The notification re-arms once usage drops back below the threshold.
 
@@ -64,7 +65,7 @@ Useful settings include:
 - automatic percent-text positioning to avoid the time-progress tick
 - percent text size (auto-fits the bar by default, or set an explicit size)
 - model weekly bar (third bar for a model-scoped weekly limit such as Fable)
-- service status dots (Claude Code for Anthropic and rolled-up Codex status for OpenAI)
+- service status dots based on the worst status across all Anthropic or OpenAI components
 - click action: refresh account or open provider dashboard (Antigravity always refreshes)
 - cloud poll interval (Antigravity polls its local server every minute)
 - taskbar monitor mode: primary, all, or specific monitor number (`1` = primary, `2+` = secondary taskbars)
