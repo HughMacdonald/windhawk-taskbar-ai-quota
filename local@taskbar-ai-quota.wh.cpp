@@ -126,6 +126,9 @@ Have a suggestion or found a bug?
 - showTimeProgress: false
   $name: Show time progress
   $description: 'Default: false. Shows a thin marker on each bar indicating elapsed or remaining time, following Bar mode.'
+- showOverPaceWarning: false
+  $name: Show over-pace warning
+  $description: 'Default: false. Shows a "!" at the start of a bar when its usage percentage is ahead of how far through that reset period it is.'
 - showLabels: true
   $name: Show labels
   $description: 'Default: true'
@@ -299,6 +302,7 @@ struct Settings {
     bool showPercentText = false;
     bool autoAdjustPercentTextPosition = false;
     bool showTimeProgress = false;
+    bool showOverPaceWarning = false;
     bool showCodexSparkInTooltip = false;
     bool showModelWeeklyBar = true;
     bool showServiceStatus = false;
@@ -362,6 +366,7 @@ struct AppliedState {
     int barVisible[kWindowCount] = {-1, -1, -1};  // -1 unset, 0 collapsed, 1 visible.
     int timeProgressPx[kWindowCount] = {-1, -1, -1};
     int timeProgressVisible[kWindowCount] = {-1, -1, -1};
+    int overPaceVisible[kWindowCount] = {-1, -1, -1};
     std::wstring tip;
     std::wstring percentText[kWindowCount];
     std::wstring labelText;
@@ -401,6 +406,8 @@ struct AccountUiRefs {
                                                          Border{nullptr}};
     std::array<Border, kWindowCount> percentPills{Border{nullptr}, Border{nullptr},
                                                   Border{nullptr}};
+    std::array<Border, kWindowCount> overPaceMarks{Border{nullptr}, Border{nullptr},
+                                                   Border{nullptr}};
     std::array<TranslateTransform, kWindowCount> percentTransforms{
         TranslateTransform{nullptr}, TranslateTransform{nullptr}, TranslateTransform{nullptr}};
     std::array<TextBlock, kWindowCount> percents{TextBlock{nullptr}, TextBlock{nullptr},
@@ -3042,7 +3049,8 @@ static DWORD WINAPI FetchThreadProc(LPVOID) {
         int refreshAccountIndex = g_refreshAccountIndex.load();
         std::vector<AccountConfig> accounts;
         int intervalMin, redThreshold;
-        bool enableNotifications, showModelWeeklyBar, showServiceStatus, showTimeProgress;
+        bool enableNotifications, showModelWeeklyBar, showServiceStatus, showTimeProgress,
+            showOverPaceWarning;
         ULONGLONG settingsGeneration;
         {
             std::lock_guard<std::mutex> lk(g_settingsMutex);
@@ -3053,6 +3061,7 @@ static DWORD WINAPI FetchThreadProc(LPVOID) {
             showModelWeeklyBar = g_settings.showModelWeeklyBar;
             showServiceStatus = g_settings.showServiceStatus;
             showTimeProgress = g_settings.showTimeProgress;
+            showOverPaceWarning = g_settings.showOverPaceWarning;
             settingsGeneration = g_settingsGeneration;
         }
         bool settingsChanged = lastLoggedSettingsGeneration != settingsGeneration ||
@@ -3256,7 +3265,7 @@ static DWORD WINAPI FetchThreadProc(LPVOID) {
 
         DWORD waitMs = (DWORD)intervalMin * 60000;
         // Keep elapsed-time markers reasonably current without making another quota request.
-        if (showTimeProgress) waitMs = std::min(waitMs, (DWORD)60000);
+        if (showTimeProgress || showOverPaceWarning) waitMs = std::min(waitMs, (DWORD)60000);
         if (anyError) waitMs = std::min(waitMs, (DWORD)120000);
         ULONGLONG nowMs = NowUnixMs();
         if (nextRetryMs > nowMs) {
@@ -3618,7 +3627,8 @@ static Grid BuildQuotaGrid(QuotaUiInstance& state) {
         std::vector<AccountConfig> accounts;
         int barLength, barThickness, labelFontSize, percentFontSetting, accountMargin, labelGap,
             barGap, rightMargin;
-        bool showLabels, labelOnLeft, showPercentText, showServiceStatus, showTimeProgress;
+        bool showLabels, labelOnLeft, showPercentText, showServiceStatus, showTimeProgress,
+            showOverPaceWarning;
         BarLayout barLayout;
         ClickAction clickAction;
         {
@@ -3639,6 +3649,7 @@ static Grid BuildQuotaGrid(QuotaUiInstance& state) {
             showPercentText = g_settings.showPercentText;
             showServiceStatus = g_settings.showServiceStatus;
             showTimeProgress = g_settings.showTimeProgress;
+            showOverPaceWarning = g_settings.showOverPaceWarning;
         }
         state.accountRefs.clear();
         if (accounts.empty()) return nullptr;
@@ -3793,9 +3804,9 @@ static Grid BuildQuotaGrid(QuotaUiInstance& state) {
                 track.Child(barVisual);
 
                 FrameworkElement slot{nullptr};
-                if (showPercentText) {
-                    // One percent label per bar, centered on it. The cell is pinned to the
-                    // bar's size so bar spacing never depends on the font.
+                if (showPercentText || showOverPaceWarning) {
+                    // Overlay cell for anything drawn on top of the bar. It is pinned to the
+                    // bar's size so bar spacing never depends on the overlaid text.
                     Grid cell;
                     cell.Width(verticalBars ? barThickness : barLength);
                     cell.Height(verticalBars ? barLength : barThickness);
@@ -3803,51 +3814,101 @@ static Grid BuildQuotaGrid(QuotaUiInstance& state) {
                     cell.VerticalAlignment(VerticalAlignment::Center);
                     cell.Children().Append(track);
 
-                    TextBlock percent;
-                    percent.FontSize(percentFontSize);
-                    percent.HorizontalAlignment(HorizontalAlignment::Center);
-                    percent.VerticalAlignment(VerticalAlignment::Center);
-                    percent.TextAlignment(TextAlignment::Center);
-                    // XAML layout-clips a child arranged smaller than it wants, which crops
-                    // text bigger than the bar. Symmetric negative margins widen the label's
-                    // arrange rect past the cell without resizing it, so oversized text spills
-                    // over its bar (and its neighbours) instead of being cropped or pushing
-                    // the bars apart. Overhang scales with the font so it always has room.
-                    double overhangX = percentFontSize * 2.0;
-                    double overhangY = percentFontSize;
+                    if (showOverPaceWarning) {
+                        // Pinned to the start of the bar (left when stacked, bottom when
+                        // vertical); shown only while usage runs ahead of elapsed time.
+                        TextBlock pace;
+                        pace.Text(L"!");
+                        pace.FontSize(percentFontSize);
+                        pace.FontWeight(winrt::Windows::UI::Text::FontWeights::SemiBold());
+                        pace.HorizontalAlignment(HorizontalAlignment::Center);
+                        pace.VerticalAlignment(VerticalAlignment::Center);
+                        pace.TextAlignment(TextAlignment::Center);
+                        pace.Foreground(
+                            SolidColorBrush(winrt::Windows::UI::Color{255, 255, 255, 255}));
+                        pace.Opacity(0.95);
+                        pace.IsHitTestVisible(false);
+                        swprintf(name, ARRAYSIZE(name), L"AiQuota_Pace_%d_%d", (int)i, w);
+                        pace.Name(name);
 
-                    percent.Foreground(SolidColorBrush(winrt::Windows::UI::Color{255, 255, 255, 255}));
-                    percent.Opacity(0.9);
-                    percent.IsHitTestVisible(false);
-                    swprintf(name, ARRAYSIZE(name), L"AiQuota_Percent_%d_%d", (int)i, w);
-                    percent.Name(name);
-                    refs.percents[w] = percent;
-
-                    Border percentPill;
-                    percentPill.HorizontalAlignment(HorizontalAlignment::Center);
-                    percentPill.VerticalAlignment(VerticalAlignment::Center);
-                    percentPill.Margin({-overhangX, 0, -overhangX, 0});
-                    if (!verticalBars) {
-                        // Keep the background exactly within the horizontal bar while the
-                        // negative text margin still lets an oversized font render uncropped.
-                        percentPill.Height(barThickness);
-                        percent.Margin({0, -overhangY, 0, -overhangY});
+                        Border paceMark;
+                        paceMark.HorizontalAlignment(verticalBars ? HorizontalAlignment::Center
+                                                                  : HorizontalAlignment::Left);
+                        paceMark.VerticalAlignment(verticalBars ? VerticalAlignment::Bottom
+                                                                : VerticalAlignment::Center);
+                        // Sit just inside the bar rather than flush with its start, so the
+                        // badge clears the track's rounded cap.
+                        double paceInset = std::max(3.0, radius);
+                        // Same trick as the percent pill: negative margins widen the arrange
+                        // rect past the cell so a glyph bigger than the bar renders uncropped
+                        // instead of being clipped, without changing the bar's own size.
+                        double paceOverhang = percentFontSize;
+                        if (verticalBars) {
+                            paceMark.Margin({-paceOverhang, 0, -paceOverhang, paceInset});
+                        } else {
+                            paceMark.Height(barThickness);
+                            paceMark.Margin({paceInset, 0, 0, 0});
+                            pace.Margin({0, -paceOverhang, 0, -paceOverhang});
+                        }
+                        paceMark.Padding({2, 0, 2, 0});
+                        paceMark.CornerRadius({2, 2, 2, 2});
+                        paceMark.Background(SolidColorBrush(
+                            winrt::Windows::UI::Color{0x80, 0x00, 0x00, 0x00}));
+                        paceMark.IsHitTestVisible(false);
+                        paceMark.Visibility(Visibility::Collapsed);
+                        paceMark.Child(pace);
+                        refs.overPaceMarks[w] = paceMark;
+                        cell.Children().Append(paceMark);
                     }
-                    percentPill.Padding({2, 0, 2, 0});
-                    percentPill.CornerRadius({2, 2, 2, 2});
-                    percentPill.Background(SolidColorBrush(
-                        winrt::Windows::UI::Color{0x80, 0x00, 0x00, 0x00}));
-                    percentPill.IsHitTestVisible(false);
-                    percentPill.Visibility(Visibility::Collapsed);
-                    percentPill.Child(percent);
-                    refs.percentPills[w] = percentPill;
 
-                    TranslateTransform percentTransform;
-                    percentPill.RenderTransform(percentTransform);
-                    refs.percentTransforms[w] = percentTransform;
-                    // The track contains both fill and marker; appending this pill after it
-                    // keeps the dark background and its white text above every bar layer.
-                    cell.Children().Append(percentPill);
+                    if (showPercentText) {
+                        // One percent label per bar, centered on it.
+                        TextBlock percent;
+                        percent.FontSize(percentFontSize);
+                        percent.HorizontalAlignment(HorizontalAlignment::Center);
+                        percent.VerticalAlignment(VerticalAlignment::Center);
+                        percent.TextAlignment(TextAlignment::Center);
+                        // XAML layout-clips a child arranged smaller than it wants, which crops
+                        // text bigger than the bar. Symmetric negative margins widen the label's
+                        // arrange rect past the cell without resizing it, so oversized text spills
+                        // over its bar (and its neighbours) instead of being cropped or pushing
+                        // the bars apart. Overhang scales with the font so it always has room.
+                        double overhangX = percentFontSize * 2.0;
+                        double overhangY = percentFontSize;
+
+                        percent.Foreground(SolidColorBrush(winrt::Windows::UI::Color{255, 255, 255, 255}));
+                        percent.Opacity(0.9);
+                        percent.IsHitTestVisible(false);
+                        swprintf(name, ARRAYSIZE(name), L"AiQuota_Percent_%d_%d", (int)i, w);
+                        percent.Name(name);
+                        refs.percents[w] = percent;
+
+                        Border percentPill;
+                        percentPill.HorizontalAlignment(HorizontalAlignment::Center);
+                        percentPill.VerticalAlignment(VerticalAlignment::Center);
+                        percentPill.Margin({-overhangX, 0, -overhangX, 0});
+                        if (!verticalBars) {
+                            // Keep the background exactly within the horizontal bar while the
+                            // negative text margin still lets an oversized font render uncropped.
+                            percentPill.Height(barThickness);
+                            percent.Margin({0, -overhangY, 0, -overhangY});
+                        }
+                        percentPill.Padding({2, 0, 2, 0});
+                        percentPill.CornerRadius({2, 2, 2, 2});
+                        percentPill.Background(SolidColorBrush(
+                            winrt::Windows::UI::Color{0x80, 0x00, 0x00, 0x00}));
+                        percentPill.IsHitTestVisible(false);
+                        percentPill.Visibility(Visibility::Collapsed);
+                        percentPill.Child(percent);
+                        refs.percentPills[w] = percentPill;
+
+                        TranslateTransform percentTransform;
+                        percentPill.RenderTransform(percentTransform);
+                        refs.percentTransforms[w] = percentTransform;
+                        // The track contains both fill and marker; appending this pill after it
+                        // keeps the dark background and its white text above every bar layer.
+                        cell.Children().Append(percentPill);
+                    }
 
                     slot = cell;
                 } else {
@@ -4139,8 +4200,8 @@ static void UpdateQuotaUi(QuotaUiInstance& state) {
     std::vector<AccountConfig> accounts;
     int intervalMin, barLength, yellowThreshold, orangeThreshold, redThreshold;
     bool showPercentText, autoAdjustPercentTextPosition, showTimeProgress,
-        showCodexSparkInTooltip, showModelWeeklyBar, showServiceStatus, colorblindMode,
-        showStaleWarning;
+        showOverPaceWarning, showCodexSparkInTooltip, showModelWeeklyBar, showServiceStatus,
+        colorblindMode, showStaleWarning;
     BarLayout barLayout;
     BarMode barMode;
     ClickAction clickAction;
@@ -4158,6 +4219,7 @@ static void UpdateQuotaUi(QuotaUiInstance& state) {
         showPercentText = g_settings.showPercentText;
         autoAdjustPercentTextPosition = g_settings.autoAdjustPercentTextPosition;
         showTimeProgress = g_settings.showTimeProgress;
+        showOverPaceWarning = g_settings.showOverPaceWarning;
         showCodexSparkInTooltip = g_settings.showCodexSparkInTooltip;
         showModelWeeklyBar = g_settings.showModelWeeklyBar;
         showServiceStatus = g_settings.showServiceStatus;
@@ -4271,6 +4333,21 @@ static void UpdateQuotaUi(QuotaUiInstance& state) {
                             }
                             ap.timeProgressPx[w] = progressPx;
                         }
+                    }
+                }
+
+                if (ui.overPaceMarks[w]) {
+                    // Compare real usage against real elapsed time, so the mark means the
+                    // same thing in both bar modes (in Remaining mode both values invert).
+                    double elapsedPct = WindowTimeElapsedPct(wu, now);
+                    int overPace = showOverPaceWarning && wu.pct >= 0 && elapsedPct >= 0 &&
+                                           wu.pct > elapsedPct
+                                       ? 1
+                                       : 0;
+                    if (overPace != ap.overPaceVisible[w]) {
+                        ui.overPaceMarks[w].Visibility(overPace ? Visibility::Visible
+                                                                : Visibility::Collapsed);
+                        ap.overPaceVisible[w] = overPace;
                     }
                 }
 
@@ -4880,6 +4957,7 @@ static void LoadSettings() {
     s.autoAdjustPercentTextPosition =
         getBoolSetting(L"autoAdjustPercentTextPosition", false);
     s.showTimeProgress = getBoolSetting(L"showTimeProgress", false);
+    s.showOverPaceWarning = getBoolSetting(L"showOverPaceWarning", false);
     s.showCodexSparkInTooltip = getBoolSetting(L"showCodexSparkInTooltip", false);
     s.showModelWeeklyBar = getBoolSetting(L"showModelWeeklyBar", true);
     s.showServiceStatus = getBoolSetting(L"showServiceStatus", false);

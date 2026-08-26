@@ -27,6 +27,10 @@ current reset period it is. It advances in Used mode and counts down in Remainin
 the tooltip includes the current percentage. An optional auto-adjustment moves percent text
 aside as the tick passes through the center of a bar.
 
+An optional over-pace warning puts a `!` at the start of a bar whenever that window's usage
+percentage is ahead of how far through its reset period you are - i.e. you are burning quota
+faster than the clock. It works in both bar modes and does not need the time-progress tick.
+
 An optional status dot beside each Anthropic/OpenAI account shows the worst current status
 across all components reported by that provider's status page. Green means operational,
 yellow degraded, orange a partial outage, red a major outage, blue maintenance, and grey
@@ -59,6 +63,7 @@ Useful settings include:
 - bar length, thickness, and layout
 - bar mode: used (fills as quota is consumed) or remaining (fills with quota left, tooltips show "X% remaining")
 - time-progress markers showing how far through each quota reset period it is
+- over-pace warning (`!` at the start of a bar when usage is ahead of elapsed period time)
 - label position and font size
 - account, label, bar, and tray spacing
 - compact percent text (each bar labelled with its own percentage)
