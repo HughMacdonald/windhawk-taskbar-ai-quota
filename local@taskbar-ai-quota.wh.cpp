@@ -421,7 +421,7 @@ struct AccountUiRefs {
 struct QuotaUiInstance {
     HWND hWnd = nullptr;
     Grid quotaGrid{nullptr};
-    Grid injectionParent{nullptr};
+    Panel injectionParent{nullptr};
     int quotaColumn = -1;
     bool insertedColumn = false;
     std::vector<PointerHandlers> pointerHandlers;
@@ -4503,16 +4503,16 @@ static void UpdateQuotaUi(QuotaUiInstance& state) {
     }
 }
 
-static int RemoveQuotaChildren(Grid const& targetGrid, QuotaUiInstance& state) {
-    if (!targetGrid) return -1;
+static int RemoveQuotaChildren(Panel const& target, QuotaUiInstance& state) {
+    if (!target) return -1;
     ClearQuotaEventState(state);
 
     int firstCol = -1;
-    for (int i = (int)targetGrid.Children().Size() - 1; i >= 0; --i) {
-        auto fe = targetGrid.Children().GetAt(i).try_as<FrameworkElement>();
+    for (int i = (int)target.Children().Size() - 1; i >= 0; --i) {
+        auto fe = target.Children().GetAt(i).try_as<FrameworkElement>();
         if (fe && fe.Name() == kRootName) {
             if (firstCol < 0) firstCol = Grid::GetColumn(fe);
-            try { targetGrid.Children().RemoveAt(i); } catch (...) {}
+            try { target.Children().RemoveAt(i); } catch (...) {}
         }
     }
     return firstCol;
@@ -4529,10 +4529,12 @@ static void RemoveQuotaGridFromState(QuotaUiInstance& state) {
     }
 
     try {
-        auto targetGrid = state.injectionParent;
-        int quotaCol = RemoveQuotaChildren(targetGrid, state);
+        Panel target = state.injectionParent;
+        int quotaCol = RemoveQuotaChildren(target, state);
         if (quotaCol < 0) quotaCol = state.quotaColumn;
-        if (state.insertedColumn && quotaCol >= 0 && quotaCol < (int)targetGrid.ColumnDefinitions().Size()) {
+        auto targetGrid = target.try_as<Grid>();
+        if (targetGrid && state.insertedColumn && quotaCol >= 0 &&
+            quotaCol < (int)targetGrid.ColumnDefinitions().Size()) {
             for (uint32_t i = 0; i < targetGrid.Children().Size(); ++i) {
                 auto child = targetGrid.Children().GetAt(i).try_as<FrameworkElement>();
                 if (child) {
@@ -4577,12 +4579,14 @@ static bool InjectQuotaGrid(HWND hWnd) {
         auto root = xamlRoot.Content().try_as<FrameworkElement>();
         if (!root) return fail(L"no XamlRoot content");
         auto trayFrame = FindChildByName(root, L"SystemTrayFrameGrid");
-        auto trayGrid = trayFrame ? trayFrame.try_as<Grid>() : nullptr;
-        // On a cold start the XamlRoot is ready before the system tray contents are realized
-        // in the visual tree, so SystemTrayFrameGrid may be missing for the first attempts.
-        // Bail and let the retry loop poll until it appears; never inject elsewhere, which
-        // would render the bars on top of the clock/tray.
-        if (!trayGrid) return fail(L"no SystemTrayFrameGrid");
+        // Cold start: the tray may not be realized yet; the retry loop polls until it is.
+        if (!trayFrame) return fail(L"no SystemTrayFrameGrid");
+
+        // Older builds: Grid (insert a column). Newer builds (e.g. 26300): StackPanel.
+        auto trayGrid = trayFrame.try_as<Grid>();
+        StackPanel trayStack{nullptr};
+        if (!trayGrid) trayStack = trayFrame.try_as<StackPanel>();
+        if (!trayGrid && !trayStack) return fail(L"SystemTrayFrameGrid has unsupported type");
 
         state = FindUiState(hWnd);
         if (!state) {
@@ -4591,19 +4595,25 @@ static bool InjectQuotaGrid(HWND hWnd) {
             state = newState.get();
             g_uiInstances.push_back(std::move(newState));
         }
-        state->injectionParent = trayGrid;
 
-        int oldCol = RemoveQuotaChildren(trayGrid, *state);
-        if (oldCol >= 0 && oldCol < (int)trayGrid.ColumnDefinitions().Size()) {
-            for (uint32_t i = 0; i < trayGrid.Children().Size(); ++i) {
-                auto child = trayGrid.Children().GetAt(i).try_as<FrameworkElement>();
-                if (child) {
-                    int childCol = Grid::GetColumn(child);
-                    if (childCol > oldCol) Grid::SetColumn(child, childCol - 1);
+        if (trayGrid) {
+            state->injectionParent = trayGrid;
+            int oldCol = RemoveQuotaChildren(trayGrid, *state);
+            if (oldCol >= 0 && oldCol < (int)trayGrid.ColumnDefinitions().Size()) {
+                for (uint32_t i = 0; i < trayGrid.Children().Size(); ++i) {
+                    auto child = trayGrid.Children().GetAt(i).try_as<FrameworkElement>();
+                    if (child) {
+                        int childCol = Grid::GetColumn(child);
+                        if (childCol > oldCol) Grid::SetColumn(child, childCol - 1);
+                    }
                 }
+                trayGrid.ColumnDefinitions().RemoveAt(oldCol);
             }
-            trayGrid.ColumnDefinitions().RemoveAt(oldCol);
+        } else {
+            state->injectionParent = trayStack;
+            RemoveQuotaChildren(trayStack, *state);
         }
+
         Grid quota = BuildQuotaGrid(*state);
         if (!quota) {
             ClearQuotaEventState(*state);
@@ -4615,18 +4625,24 @@ static bool InjectQuotaGrid(HWND hWnd) {
             return fail(L"BuildQuotaGrid failed");
         }
 
-        ColumnDefinition newCol;
-        newCol.Width({1.0, GridUnitType::Auto});
-        trayGrid.ColumnDefinitions().InsertAt(0, newCol);
-        state->quotaColumn = 0;
-        state->insertedColumn = true;
-        for (uint32_t i = 0; i < trayGrid.Children().Size(); ++i) {
-            auto child = trayGrid.Children().GetAt(i).try_as<FrameworkElement>();
-            if (child) Grid::SetColumn(child, Grid::GetColumn(child) + 1);
+        if (trayGrid) {
+            ColumnDefinition newCol;
+            newCol.Width({1.0, GridUnitType::Auto});
+            trayGrid.ColumnDefinitions().InsertAt(0, newCol);
+            state->quotaColumn = 0;
+            state->insertedColumn = true;
+            for (uint32_t i = 0; i < trayGrid.Children().Size(); ++i) {
+                auto child = trayGrid.Children().GetAt(i).try_as<FrameworkElement>();
+                if (child) Grid::SetColumn(child, Grid::GetColumn(child) + 1);
+            }
+            Grid::SetColumn(quota, 0);
+            trayGrid.Children().Append(quota);
+        } else {
+            state->quotaColumn = -1;
+            state->insertedColumn = false;
+            trayStack.Children().InsertAt(0, quota);
         }
-        Grid::SetColumn(quota, 0);
-        trayGrid.Children().Append(quota);
-
+        
         state->quotaGrid = quota;
         g_uiInjected.store(true, std::memory_order_release);
         state->applied.clear();
