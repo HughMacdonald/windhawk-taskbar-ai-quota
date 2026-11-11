@@ -91,6 +91,7 @@ Signing in uses the public OAuth clients of the official CLIs (Claude Code for A
 ## Limitations
 
 - Windows 11 taskbar only.
+- Right after a Windows update, Microsoft may not have published the new `taskbar.dll` symbols yet. The mod then finds the taskbar through XAML Diagnostics instead, so the bars still show; it switches back to symbols automatically once they appear.
 - Specific monitor numbers use taskbar order: `1` is primary, `2+` are secondary taskbars in monitor order.
 - Anthropic/OpenAI require signing in once from the right-click menu.
 - Antigravity requires its signed-in app to remain running with a workspace open.

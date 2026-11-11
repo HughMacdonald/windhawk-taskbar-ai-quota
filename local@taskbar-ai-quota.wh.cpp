@@ -206,6 +206,7 @@ Have a suggestion or found a bug?
 #include <wincrypt.h>
 #include <dpapi.h>
 #include <unknwn.h>
+#include <xamlOM.h>
 
 #ifdef GetCurrentTime
 #undef GetCurrentTime
@@ -221,6 +222,7 @@ Have a suggestion or found a bug?
 #include <winrt/Windows.UI.Xaml.Controls.h>
 #include <winrt/Windows.UI.Xaml.Controls.Primitives.h>
 #include <winrt/Windows.UI.Xaml.Documents.h>
+#include <winrt/Windows.UI.Xaml.Hosting.h>
 #include <winrt/Windows.UI.Xaml.Input.h>
 #include <winrt/Windows.UI.Xaml.Media.h>
 
@@ -245,6 +247,7 @@ using namespace winrt::Windows::UI::Xaml::Media;
 
 namespace wuxcp = winrt::Windows::UI::Xaml::Controls::Primitives;
 namespace wuxd = winrt::Windows::UI::Xaml::Documents;
+namespace wuxh = winrt::Windows::UI::Xaml::Hosting;
 namespace wuxi = winrt::Windows::UI::Xaml::Input;
 
 /**********************************************/
@@ -450,6 +453,8 @@ static HANDLE g_stopEvent = nullptr;
 static HANDLE g_refreshEvent = nullptr;
 static HANDLE g_fetchThread = nullptr;
 static HANDLE g_retryThread = nullptr;
+static std::mutex g_retryThreadMutex;
+static std::atomic<bool> g_retryRequested{false};
 static std::atomic<ULONGLONG> g_nextInjectFailureLogMs{0};
 static std::mutex g_httpHandlesMutex;
 static std::vector<HINTERNET> g_httpHandles;
@@ -466,6 +471,7 @@ static constexpr ULONGLONG kUnixTimestampMsThreshold = 100000000000ULL;
 using WindowThreadProc = bool (*)(void*);
 static bool RunFromWindowThread(HWND hWnd, WindowThreadProc proc, void* param, DWORD timeoutMs = 2000);
 static std::vector<HWND> FindCurrentProcessTaskbarWnds();
+static void StartRetryInject();
 static QuotaUiInstance* FindUiState(HWND hWnd);
 static void UpdateQuotaUi(QuotaUiInstance& state);
 static void PostUiUpdate();
@@ -3543,7 +3549,323 @@ static HRESULT TryGetTaskbarElementAbi(HWND hTaskbarWnd, void** result) {
     return hr;
 }
 
+/**********************************************/
+//  Symbol-free fallback (XAML Diagnostics)
+/**********************************************/
+
+// When the taskbar.dll symbols can't be resolved (e.g. Microsoft hasn't published the PDB for a
+// fresh cumulative update yet), the mod registers itself as a XAML Diagnostics TAP instead. The
+// visual tree watcher is told about every DesktopWindowXamlSource as it's created, and each one
+// maps to its taskbar window through the island HWND. A new SystemTrayFrameGrid stands in for the
+// TrayUI::StartTaskbar hook as the "taskbar was (re)built" signal.
+static bool g_useXamlDiagnostics = false;
+static std::atomic<bool> g_xamlDiagnosticsStarted{false};
+static std::atomic<HANDLE> g_adviseThread{nullptr};
+static std::atomic<ULONGLONG> g_nextXamlDiagnosticsLogMs{0};
+
+// {34b63fda-f65e-4e26-bc7a-303d76eaee1c}
+static constexpr CLSID CLSID_QuotaTap = {
+    0x34b63fda, 0xf65e, 0x4e26, {0xbc, 0x7a, 0x30, 0x3d, 0x76, 0xea, 0xee, 0x1c}};
+
+// IDesktopWindowXamlSourceNative, declared locally so it's queried by IID without the interop header.
+struct IDesktopWindowXamlSourceNativeAbi : ::IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE AttachToWindow(HWND parentWnd) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_WindowHandle(HWND* hWnd) = 0;
+};
+static constexpr IID IID_IDesktopWindowXamlSourceNativeAbi = {
+    0x3cbcf1bf, 0x2f76, 0x4e9c, {0x96, 0xab, 0xe8, 0x4b, 0x37, 0x97, 0x25, 0x54}};
+
+// Weak refs only, and each one is resolved solely on the UI thread that created its source.
+struct XamlSourceEntry {
+    winrt::weak_ref<wuxh::DesktopWindowXamlSource> source;
+    DWORD threadId = 0;
+};
+static std::mutex g_xamlSourcesMutex;
+static std::vector<XamlSourceEntry> g_xamlSources;
+
+static bool IsTaskbarWindow(HWND hWnd) {
+    wchar_t cls[64] = {};
+    if (!hWnd || !GetClassNameW(hWnd, cls, ARRAYSIZE(cls))) return false;
+    return _wcsicmp(cls, L"Shell_TrayWnd") == 0 || _wcsicmp(cls, L"Shell_SecondaryTrayWnd") == 0;
+}
+
+static void OnXamlSourceAdded(wuxh::DesktopWindowXamlSource const& source) {
+    auto weak = winrt::make_weak(source);
+    DWORD tid = GetCurrentThreadId();
+    std::lock_guard<std::mutex> lk(g_xamlSourcesMutex);
+    std::erase_if(g_xamlSources, [tid](XamlSourceEntry const& e) {
+        return e.threadId == tid && !e.source.get();
+    });
+    g_xamlSources.push_back({std::move(weak), tid});
+    Wh_Log(L"XAML diagnostics: tracking DesktopWindowXamlSource (thread %lu, %zu tracked)",
+           tid, g_xamlSources.size());
+}
+
+// Must run on hTaskbarWnd's thread.
+static XamlRoot GetTaskbarXamlRootFromDiagnostics(HWND hTaskbarWnd) {
+    DWORD tid = GetCurrentThreadId();
+    std::vector<winrt::weak_ref<wuxh::DesktopWindowXamlSource>> candidates;
+    {
+        std::lock_guard<std::mutex> lk(g_xamlSourcesMutex);
+        for (auto const& e : g_xamlSources) {
+            if (e.threadId == tid) candidates.push_back(e.source);
+        }
+    }
+
+    for (auto const& weak : candidates) {
+        try {
+            auto source = weak.get();
+            if (!source) continue;
+
+            winrt::com_ptr<IDesktopWindowXamlSourceNativeAbi> native;
+            if (FAILED(winrt::get_unknown(source)->QueryInterface(
+                    IID_IDesktopWindowXamlSourceNativeAbi, native.put_void())) || !native) {
+                continue;
+            }
+            HWND hIsland = nullptr;
+            if (FAILED(native->get_WindowHandle(&hIsland)) || !hIsland) continue;
+            if (GetAncestor(hIsland, GA_ROOT) != hTaskbarWnd) continue;
+
+            auto content = source.Content();
+            if (!content) continue;
+            if (auto root = content.XamlRoot()) return root;
+        } catch (...) {
+        }
+    }
+    return nullptr;
+}
+
+class VisualTreeWatcher
+    : public winrt::implements<VisualTreeWatcher, IVisualTreeServiceCallback2, winrt::non_agile> {
+public:
+    explicit VisualTreeWatcher(winrt::com_ptr<IXamlDiagnostics> diagnostics)
+        : m_diagnostics(std::move(diagnostics)) {}
+
+    HRESULT Advise() {
+        try {
+            return m_diagnostics.as<IVisualTreeService3>()->AdviseVisualTreeChange(this);
+        } catch (...) {
+            return winrt::to_hresult();
+        }
+    }
+
+    void Unadvise() {
+        try {
+            m_diagnostics.as<IVisualTreeService3>()->UnadviseVisualTreeChange(this);
+        } catch (...) {
+        }
+    }
+
+    HRESULT STDMETHODCALLTYPE OnVisualTreeChange(ParentChildRelation, VisualElement element,
+                                                 VisualMutationType mutationType) override {
+        // Called for every element in the process's XAML trees: keep the common path cheap.
+        if (g_unloading || mutationType != Add) return S_OK;
+        try {
+            if (element.Type && wcscmp(element.Type, L"Windows.UI.Xaml.Hosting.DesktopWindowXamlSource") == 0) {
+                if (auto source = FromHandle(element.Handle).try_as<wuxh::DesktopWindowXamlSource>()) {
+                    OnXamlSourceAdded(source);
+                    StartRetryInject();
+                }
+            } else if (element.Name && wcscmp(element.Name, L"SystemTrayFrameGrid") == 0) {
+                StartRetryInject();
+            }
+        } catch (...) {
+        }
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE OnElementStateChanged(InstanceHandle, VisualElementState,
+                                                    LPCWSTR) noexcept override {
+        return S_OK;
+    }
+
+private:
+    winrt::Windows::Foundation::IInspectable FromHandle(InstanceHandle handle) {
+        winrt::Windows::Foundation::IInspectable obj;
+        winrt::check_hresult(m_diagnostics->GetIInspectableFromHandle(
+            handle, reinterpret_cast<::IInspectable**>(winrt::put_abi(obj))));
+        return obj;
+    }
+
+    winrt::com_ptr<IXamlDiagnostics> m_diagnostics;
+};
+
+static std::mutex g_visualTreeWatcherMutex;
+static winrt::com_ptr<VisualTreeWatcher> g_visualTreeWatcher;
+
+static DWORD WINAPI AdviseThreadProc(LPVOID param) {
+    winrt::com_ptr<VisualTreeWatcher> watcher;
+    watcher.attach(static_cast<VisualTreeWatcher*>(param));
+    HRESULT hr = watcher->Advise();
+    if (FAILED(hr)) Wh_Log(L"XAML diagnostics: AdviseVisualTreeChange failed: 0x%08X", (unsigned)hr);
+    return 0;
+}
+
+static HMODULE GetCurrentModuleHandle() {
+    HMODULE module = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       reinterpret_cast<LPCWSTR>(&GetCurrentModuleHandle), &module);
+    return module;
+}
+
+class QuotaTap : public winrt::implements<QuotaTap, IObjectWithSite, winrt::non_agile> {
+public:
+    HRESULT STDMETHODCALLTYPE SetSite(IUnknown* site) noexcept override {
+        try {
+            {
+                std::lock_guard<std::mutex> lk(g_visualTreeWatcherMutex);
+                if (g_visualTreeWatcher) {
+                    g_visualTreeWatcher->Unadvise();
+                    g_visualTreeWatcher = nullptr;
+                }
+            }
+            m_site.copy_from(site);
+            if (!m_site) return S_OK;
+
+            // XAML Diagnostics loaded this DLL by path; drop that extra reference so Windhawk can
+            // still unload the mod.
+            FreeLibrary(GetCurrentModuleHandle());
+            if (g_unloading) return S_OK;
+
+            auto watcher = winrt::make_self<VisualTreeWatcher>(m_site.as<IXamlDiagnostics>());
+            {
+                std::lock_guard<std::mutex> lk(g_visualTreeWatcherMutex);
+                g_visualTreeWatcher = watcher;
+            }
+
+            // AdviseVisualTreeChange can hang when called from the thread that initialized the
+            // diagnostics, so advise from a worker. The worker owns one watcher reference.
+            HANDLE thread = CreateThread(nullptr, 0, AdviseThreadProc, watcher.get(), CREATE_SUSPENDED, nullptr);
+            if (!thread) {
+                Wh_Log(L"XAML diagnostics: CreateThread failed: %lu", GetLastError());
+                return S_OK;
+            }
+            watcher.detach();
+            if (HANDLE old = g_adviseThread.exchange(thread)) CloseHandle(old);
+            ResumeThread(thread);
+            return S_OK;
+        } catch (...) {
+            return winrt::to_hresult();
+        }
+    }
+
+    HRESULT STDMETHODCALLTYPE GetSite(REFIID riid, void** site) noexcept override {
+        if (!site) return E_POINTER;
+        *site = nullptr;
+        if (!m_site) return E_FAIL;
+        return m_site.as(riid, site);
+    }
+
+private:
+    winrt::com_ptr<IUnknown> m_site;
+};
+
+struct QuotaTapFactory : winrt::implements<QuotaTapFactory, IClassFactory, winrt::non_agile> {
+    HRESULT STDMETHODCALLTYPE CreateInstance(IUnknown* outer, REFIID riid, void** object) noexcept override {
+        try {
+            *object = nullptr;
+            if (outer) return CLASS_E_NOAGGREGATION;
+            return winrt::make<QuotaTap>().as(riid, object);
+        } catch (...) {
+            return winrt::to_hresult();
+        }
+    }
+
+    HRESULT STDMETHODCALLTYPE LockServer(BOOL) noexcept override { return S_OK; }
+};
+
+// XAML Diagnostics loads the TAP DLL (this mod) by path and asks it for CLSID_QuotaTap.
+// combaseapi.h already declares DllGetClassObject without dllexport; exporting it is the point.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdll-attribute-on-redeclaration"
+__declspec(dllexport) STDAPI DllGetClassObject(REFCLSID rclsid, REFIID riid, LPVOID* ppv) {
+    try {
+        *ppv = nullptr;
+        if (rclsid != CLSID_QuotaTap) return CLASS_E_CLASSNOTAVAILABLE;
+        return winrt::make<QuotaTapFactory>().as(riid, ppv);
+    } catch (...) {
+        return winrt::to_hresult();
+    }
+}
+#pragma clang diagnostic pop
+
+// Must run on a taskbar UI thread (XAML already initialized there).
+static bool StartXamlDiagnostics() {
+    if (!g_useXamlDiagnostics || g_unloading) return false;
+    if (g_xamlDiagnosticsStarted.exchange(true)) return true;
+
+    auto failed = [](PCWSTR what, HRESULT hr) {
+        g_xamlDiagnosticsStarted.store(false);
+        ULONGLONG now = NowUnixMs();
+        ULONGLONG next = g_nextXamlDiagnosticsLogMs.load();
+        if (now >= next && g_nextXamlDiagnosticsLogMs.compare_exchange_strong(next, now + 5000)) {
+            Wh_Log(L"XAML diagnostics: %s failed: 0x%08X", what, (unsigned)hr);
+        }
+        return false;
+    };
+
+    wchar_t location[MAX_PATH];
+    HMODULE module = GetCurrentModuleHandle();
+    DWORD len = module ? GetModuleFileNameW(module, location, ARRAYSIZE(location)) : 0;
+    if (!len || len >= ARRAYSIZE(location)) return failed(L"GetModuleFileName", HRESULT_FROM_WIN32(GetLastError()));
+
+    HMODULE wux = LoadLibraryExW(L"Windows.UI.Xaml.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!wux) return failed(L"LoadLibrary(Windows.UI.Xaml.dll)", HRESULT_FROM_WIN32(GetLastError()));
+    using InitializeXamlDiagnosticsEx_t = HRESULT(WINAPI*)(LPCWSTR, DWORD, LPCWSTR, LPCWSTR, CLSID, LPCWSTR);
+    auto initialize = reinterpret_cast<InitializeXamlDiagnosticsEx_t>(
+        GetProcAddress(wux, "InitializeXamlDiagnosticsEx"));
+    if (!initialize) return failed(L"GetProcAddress(InitializeXamlDiagnosticsEx)", HRESULT_FROM_WIN32(GetLastError()));
+
+    // The endpoint name isn't ours to pick: each XAML core registers "VisualDiagConnection<N>"
+    // (see DXamlCore.cpp in microsoft-ui-xaml), and there's no way to ask which N is live, so walk
+    // them until one connects. Any other name fails with ERROR_NOT_FOUND.
+    HRESULT hr = E_FAIL;
+    for (int i = 1; i <= 10000; i++) {
+        wchar_t name[64];
+        swprintf(name, ARRAYSIZE(name), L"VisualDiagConnection%d", i);
+        hr = initialize(name, GetCurrentProcessId(), L"", location, CLSID_QuotaTap, nullptr);
+        if (hr != HRESULT_FROM_WIN32(ERROR_NOT_FOUND)) break;
+    }
+    if (FAILED(hr)) return failed(L"InitializeXamlDiagnosticsEx", hr);
+
+    Wh_Log(L"XAML diagnostics fallback started");
+    return true;
+}
+
+static void StopXamlDiagnostics() {
+    if (HANDLE thread = g_adviseThread.exchange(nullptr)) {
+        WaitForSingleObject(thread, INFINITE);
+        CloseHandle(thread);
+    }
+
+    winrt::com_ptr<VisualTreeWatcher> watcher;
+    {
+        std::lock_guard<std::mutex> lk(g_visualTreeWatcherMutex);
+        watcher = std::move(g_visualTreeWatcher);
+    }
+    if (watcher) {
+        auto hWnds = FindCurrentProcessTaskbarWnds();
+        bool unadvised = !hWnds.empty() && RunFromWindowThread(hWnds[0], [](void* param) -> bool {
+            static_cast<VisualTreeWatcher*>(param)->Unadvise();
+            return true;
+        }, watcher.get(), 5000);
+        if (!unadvised) watcher->Unadvise();
+    }
+
+    std::lock_guard<std::mutex> lk(g_xamlSourcesMutex);
+    g_xamlSources.clear();
+}
+
+static bool SameObject(winrt::Windows::Foundation::IInspectable const& a,
+                       winrt::Windows::Foundation::IInspectable const& b) {
+    if (!a || !b) return false;
+    return winrt::get_abi(a.as<winrt::Windows::Foundation::IUnknown>()) ==
+           winrt::get_abi(b.as<winrt::Windows::Foundation::IUnknown>());
+}
+
 static XamlRoot GetTaskbarXamlRoot(HWND hTaskbarWnd) {
+    if (g_useXamlDiagnostics) return GetTaskbarXamlRootFromDiagnostics(hTaskbarWnd);
+
     if (!CTaskBand_ITaskListWndSite_vftable || !CTaskBand_GetTaskbarHost_Original ||
         !TaskbarHost_FrameHeight_Original) {
         return nullptr;
@@ -4557,7 +4879,12 @@ static void RemoveQuotaGridFromState(QuotaUiInstance& state) {
 
 static bool InjectQuotaGrid(HWND hWnd) {
     if (!hWnd) return false;
-    if (auto* existingState = FindUiState(hWnd); existingState && existingState->quotaGrid) return true;
+    // Fallback mode has no StartTaskbar hook to tear down a rebuilt taskbar, so it re-checks the
+    // live tray frame below instead of trusting an existing injection.
+    if (auto* existingState = FindUiState(hWnd);
+        existingState && existingState->quotaGrid && !g_useXamlDiagnostics) {
+        return true;
+    }
 
     auto fail = [&](PCWSTR reason) {
         ULONGLONG now = NowUnixMs();
@@ -4575,7 +4902,7 @@ static bool InjectQuotaGrid(HWND hWnd) {
     QuotaUiInstance* state = nullptr;
     try {
         auto xamlRoot = GetTaskbarXamlRoot(hWnd);
-        if (!xamlRoot) return fail(L"no XamlRoot");
+        if (!xamlRoot) return fail(g_useXamlDiagnostics ? L"no XamlRoot (XAML diagnostics)" : L"no XamlRoot");
         auto root = xamlRoot.Content().try_as<FrameworkElement>();
         if (!root) return fail(L"no XamlRoot content");
         auto trayFrame = FindChildByName(root, L"SystemTrayFrameGrid");
@@ -4589,6 +4916,10 @@ static bool InjectQuotaGrid(HWND hWnd) {
         if (!trayGrid && !trayStack) return fail(L"SystemTrayFrameGrid has unsupported type");
 
         state = FindUiState(hWnd);
+        if (state && state->quotaGrid) {
+            if (SameObject(state->injectionParent, trayFrame)) return true;
+            RemoveQuotaGridFromState(*state);
+        }
         if (!state) {
             auto newState = std::make_unique<QuotaUiInstance>();
             newState->hWnd = hWnd;
@@ -4701,7 +5032,11 @@ static void RemoveAllQuotaGrids(bool waitForCompletion = false) {
 
 static DWORD WINAPI RetryInjectThreadProc(LPVOID) {
     for (int attempt = 0; attempt < 600 && !g_unloading; attempt++) {
+        g_retryRequested.store(false);
         auto hWnds = FindCurrentProcessTaskbarWnds();
+        if (g_useXamlDiagnostics && !g_xamlDiagnosticsStarted.load() && !hWnds.empty()) {
+            RunFromWindowThread(hWnds[0], [](void*) -> bool { return StartXamlDiagnostics(); }, nullptr);
+        }
         TaskbarMonitorMode mode;
         int targetMonitorNumber;
         {
@@ -4726,7 +5061,7 @@ static DWORD WINAPI RetryInjectThreadProc(LPVOID) {
             }, hWnd);
             allInjected = allInjected && injected;
         }
-        if (allInjected) break;
+        if (allInjected && !g_retryRequested.load()) break;
 
         if (g_stopEvent) {
             if (WaitForSingleObject(g_stopEvent, 100) == WAIT_OBJECT_0) break;
@@ -4737,20 +5072,27 @@ static DWORD WINAPI RetryInjectThreadProc(LPVOID) {
     return 0;
 }
 
+// Called from Wh_ModAfterInit, settings changes, and taskbar UI threads (StartTaskbar hook,
+// XAML diagnostics callbacks).
 static void StartRetryInject() {
-    if (g_unloading) return;
+    DWORD err = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_retryThreadMutex);
+        if (g_unloading) return;
 
-    if (g_retryThread) {
-        DWORD state = WaitForSingleObject(g_retryThread, 0);
-        if (state == WAIT_TIMEOUT) return;
-        CloseHandle(g_retryThread);
-        g_retryThread = nullptr;
+        g_retryRequested.store(true);
+        if (g_retryThread) {
+            DWORD state = WaitForSingleObject(g_retryThread, 0);
+            if (state == WAIT_TIMEOUT) return;
+            CloseHandle(g_retryThread);
+            g_retryThread = nullptr;
+        }
+
+        g_retryThread = CreateThread(nullptr, 0, RetryInjectThreadProc, nullptr, 0, nullptr);
+        if (g_retryThread) return;
+        err = GetLastError();
     }
 
-    g_retryThread = CreateThread(nullptr, 0, RetryInjectThreadProc, nullptr, 0, nullptr);
-    if (g_retryThread) return;
-
-    DWORD err = GetLastError();
     Wh_Log(L"CreateThread RetryInjectThreadProc failed: %lu", err);
 
     bool anyInjected = false;
@@ -4779,6 +5121,23 @@ static void WINAPI TrayUI_StartTaskbar_Hook(void* pThis) {
 
     RemoveAllQuotaGrids();
     StartRetryInject();
+}
+
+using CreateWindowExW_t = decltype(&CreateWindowExW);
+static CreateWindowExW_t CreateWindowExW_Original = nullptr;
+
+// Only installed in fallback mode.
+static HWND WINAPI CreateWindowExW_Hook(DWORD dwExStyle, LPCWSTR lpClassName, LPCWSTR lpWindowName,
+                                        DWORD dwStyle, int X, int Y, int nWidth, int nHeight,
+                                        HWND hWndParent, HMENU hMenu, HINSTANCE hInstance, LPVOID lpParam) {
+    HWND hWnd = CreateWindowExW_Original(dwExStyle, lpClassName, lpWindowName, dwStyle, X, Y, nWidth,
+                                         nHeight, hWndParent, hMenu, hInstance, lpParam);
+    if (hWnd && !g_unloading && !g_xamlDiagnosticsStarted.load() && !IS_INTRESOURCE(lpClassName) &&
+        _wcsicmp(lpClassName, L"Windows.UI.Composition.DesktopWindowContentBridge") == 0 &&
+        IsTaskbarWindow(GetAncestor(hWnd, GA_ROOT))) {
+        StartXamlDiagnostics();
+    }
+    return hWnd;
 }
 
 static bool HookTaskbarDllSymbols() {
@@ -4983,8 +5342,19 @@ BOOL Wh_ModInit() {
     }
 
     if (!HookTaskbarDllSymbols()) {
-        Wh_Log(L"HookTaskbarDllSymbols failed");
-        return FALSE;
+        // Usually the PDB for a just-released taskbar.dll isn't on the symbol server yet.
+        Wh_Log(L"HookTaskbarDllSymbols failed; using XAML diagnostics fallback");
+        CTaskBand_ITaskListWndSite_vftable = nullptr;
+        CSecondaryTaskBand_ITaskListWndSite_vftable = nullptr;
+        CTaskBand_GetTaskbarHost_Original = nullptr;
+        CSecondaryTaskBand_GetTaskbarHost_Original = nullptr;
+        TaskbarHost_FrameHeight_Original = nullptr;
+        Std_Ref_Decref_Original = nullptr;
+        g_useXamlDiagnostics = true;
+        g_xamlDiagnosticsStarted.store(false);
+        if (!WindhawkUtils::SetFunctionHook(CreateWindowExW, CreateWindowExW_Hook, &CreateWindowExW_Original)) {
+            Wh_Log(L"CreateWindowExW hook failed");
+        }
     }
 
     g_stopEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
@@ -5036,10 +5406,17 @@ void Wh_ModUninit() {
     }
     g_loginInProgress.store(false);
 
-    if (g_retryThread) {
-        WaitForSingleObject(g_retryThread, INFINITE);
-        CloseHandle(g_retryThread);
+    // Take the handle under the lock but join outside it: the retry thread marshals onto UI
+    // threads that may themselves be waiting in StartRetryInject.
+    HANDLE retryThread;
+    {
+        std::lock_guard<std::mutex> lk(g_retryThreadMutex);
+        retryThread = g_retryThread;
         g_retryThread = nullptr;
+    }
+    if (retryThread) {
+        WaitForSingleObject(retryThread, INFINITE);
+        CloseHandle(retryThread);
     }
 
     if (g_fetchThread) {
@@ -5049,6 +5426,7 @@ void Wh_ModUninit() {
     }
     g_fetchThreadStarted.store(false, std::memory_order_release);
 
+    if (g_useXamlDiagnostics) StopXamlDiagnostics();
     RemoveAllQuotaGrids(true);
 
     if (g_stopEvent) CloseHandle(g_stopEvent);
